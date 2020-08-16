@@ -30,7 +30,7 @@ import akka.http.scaladsl.testkit.ScalatestRouteTest
 import akka.http.scaladsl.testkit.RouteTestTimeout
 import spray.json._
 import org.apache.openwhisk.common.TransactionId
-import org.apache.openwhisk.core.WhiskConfig
+import org.apache.openwhisk.core.{FeatureFlags, WhiskConfig}
 import org.apache.openwhisk.core.connector.ActivationMessage
 import org.apache.openwhisk.core.containerpool.logging.LogStoreProvider
 import org.apache.openwhisk.core.controller.{CustomHeaders, RestApiCommons, WhiskServices}
@@ -73,7 +73,7 @@ protected trait ControllerTestCommon
   override lazy val entitlementProvider: EntitlementProvider =
     new LocalEntitlementProvider(whiskConfig, loadBalancer, instance)
 
-  override val activationIdFactory = new ActivationId.ActivationIdGenerator() {
+  override val activationIdFactory = new ActivationId.ActivationIdGenerator {
     // need a static activation id to test activations api
     private val fixedId = ActivationId.generate()
     override def make = fixedId
@@ -83,6 +83,27 @@ protected trait ControllerTestCommon
     new CacheChangeNotification {
       override def apply(k: CacheKey): Future[Unit] = Future.successful(())
     }
+  }
+
+  def checkWhiskEntityResponse(response: WhiskEntity, expected: WhiskEntity): Unit = {
+    // Used to ignore `updated` field because timestamp is not known before inserting into the DB
+    // If you use this method, test case that checks timestamp must be added
+    val r = response match {
+      case whiskAction: WhiskAction                 => whiskAction.copy(updated = expected.updated)
+      case whiskActionMetaData: WhiskActionMetaData => whiskActionMetaData.copy(updated = expected.updated)
+      case whiskTrigger: WhiskTrigger               => whiskTrigger.copy(updated = expected.updated)
+      case whiskPackage: WhiskPackage               => whiskPackage.copy(updated = expected.updated)
+    }
+    r should be(expected)
+  }
+
+  def systemAnnotations(kind: String, create: Boolean = true): Parameters = {
+    val base = if (create && FeatureFlags.requireApiKeyAnnotation) {
+      Parameters(Annotations.ProvideApiKeyAnnotationName, JsFalse)
+    } else {
+      Parameters()
+    }
+    base ++ Parameters(WhiskAction.execFieldName, kind)
   }
 
   val entityStore = WhiskEntityStore.datastore()
@@ -103,9 +124,15 @@ protected trait ControllerTestCommon
     Await.result(activationStore.get(activationId, context), timeout)
   }
 
-  def storeActivation(activation: WhiskActivation, context: UserContext)(implicit transid: TransactionId,
-                                                                         timeout: Duration = 10 seconds): DocInfo = {
-    val docFuture = activationStore.storeAfterCheck(activation, context)
+  def storeActivation(
+    activation: WhiskActivation,
+    isBlockingActivation: Boolean,
+    disableStore: Boolean,
+    context: UserContext)(implicit transid: TransactionId, timeout: Duration = 10 seconds): DocInfo = {
+    val docFuture = activationStore.storeAfterCheck(activation, isBlockingActivation, Some(disableStore), context)(
+      transid,
+      notifier = None,
+      logging)
     val doc = Await.result(docFuture, timeout)
     assert(doc != null)
     doc
@@ -227,19 +254,68 @@ protected trait ControllerTestCommon
     implicit val serdes = jsonFormat5(BadEntity.apply)
     override val cacheEnabled = true
   }
+
+  /**
+   * Makes a simple sequence action and installs it in the db (no call to wsk api/cli).
+   * All actions are in the default package.
+   *
+   * @param sequenceName the name of the sequence
+   * @param ns           the namespace to be used when creating the component actions and the sequence action
+   * @param components   the names of the actions (entity names, no namespace)
+   */
+  protected def putSimpleSequenceInDB(sequenceName: String, ns: EntityPath, components: Vector[String])(
+    implicit tid: TransactionId) = {
+    val seqAction = makeSimpleSequence(sequenceName, ns, components)
+    put(entityStore, seqAction)
+  }
+
+  /**
+   * Returns a WhiskAction that can be used to create/update a sequence.
+   * If instructed to do so, installs the component actions in the db.
+   * All actions are in the default package.
+   *
+   * @param sequenceName   the name of the sequence
+   * @param ns             the namespace to be used when creating the component actions and the sequence action
+   * @param componentNames the names of the actions (entity names, no namespace)
+   * @param installDB      if true, installs the component actions in the db (default true)
+   */
+  protected def makeSimpleSequence(sequenceName: String,
+                                   ns: EntityPath,
+                                   componentNames: Vector[String],
+                                   installDB: Boolean = true)(implicit tid: TransactionId): WhiskAction = {
+    if (installDB) {
+      // create bogus wsk actions
+      val wskActions = componentNames.toSet[String] map { c =>
+        WhiskAction(ns, EntityName(c), jsDefault("??"))
+      }
+      // add them to the db
+      wskActions.foreach {
+        put(entityStore, _)
+      }
+    }
+    // add namespace to component names
+    val components = componentNames map { c =>
+      stringToFullyQualifiedName(s"/$ns/$c")
+    }
+    // create wsk action for the sequence
+    WhiskAction(ns, EntityName(sequenceName), sequence(components))
+  }
 }
 
 class DegenerateLoadBalancerService(config: WhiskConfig)(implicit ec: ExecutionContext) extends LoadBalancer {
   import scala.concurrent.blocking
 
   // unit tests that need an activation via active ack/fast path should set this to value expected
-  var whiskActivationStub: Option[(FiniteDuration, WhiskActivation)] = None
+  var whiskActivationStub: Option[(FiniteDuration, Either[ActivationId, WhiskActivation])] = None
+  var activationMessageChecker: Option[ActivationMessage => Unit] = None
 
   override def totalActiveActivations = Future.successful(0)
   override def activeActivationsFor(namespace: UUID) = Future.successful(0)
 
   override def publish(action: ExecutableWhiskActionMetaData, msg: ActivationMessage)(
-    implicit transid: TransactionId): Future[Future[Either[ActivationId, WhiskActivation]]] =
+    implicit transid: TransactionId): Future[Future[Either[ActivationId, WhiskActivation]]] = {
+    activationMessageChecker.foreach(_(msg))
+
     Future.successful {
       whiskActivationStub map {
         case (timeout, activation) =>
@@ -249,10 +325,11 @@ class DegenerateLoadBalancerService(config: WhiskConfig)(implicit ec: ExecutionC
               Thread.sleep(timeout.toMillis)
               println(".... done waiting")
             }
-            Right(activation)
+            activation
           }
       } getOrElse Future.failed(new IllegalArgumentException("Unit test does not need fast path"))
     }
+  }
 
   override def invokerHealth() = Future.successful(IndexedSeq.empty)
 }

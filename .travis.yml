@@ -15,13 +15,10 @@
 # limitations under the License.
 #
 
-sudo: required
-
-group: deprecated-2017Q3
-
-language: scala
-scala:
-   - 2.12.7
+os: linux
+dist: xenial
+language: java
+jdk: openjdk11
 
 services:
   - docker
@@ -57,8 +54,10 @@ cache:
     - $HOME/.gradle/wrapper/
 
 before_install:
-  - pip install --upgrade pip setuptools six
-  - pip3 install --upgrade pip setuptools six
+  - ./tools/travis/docker.sh
+  - sudo apt-get install -y python3-pip
+  - pip install --user --upgrade pip setuptools six
+  - pip3 install --user setuptools six
 
 install:
   - ./tools/travis/setup.sh
@@ -66,17 +65,24 @@ install:
 jobs:
   include:
     - script:
+        - TERM=dumb OW_SCALA_VERSION=2.13 ./gradlew :tests:compileTestScala
+      name: "Scala 2.13 compilation"
+    - script:
         - ./tools/travis/runUnitTests.sh
         - ./tools/travis/checkAndUploadLogs.sh unit db
       name: "Unit Tests"
     - script:
-       - ./tools/travis/runSystemTests.sh
-       - ./tools/travis/checkAndUploadLogs.sh system
+      - ./tools/travis/runSystemTests.sh
+      - ./tools/travis/checkAndUploadLogs.sh system
       name: "System Tests"
     - script:
       - ./tools/travis/runMultiRuntimeTests.sh
       - ./tools/travis/checkAndUploadLogs.sh multi-runtime
       name: "Multi-Runtime Tests"
+    - script:
+        - ./tools/travis/runStandaloneTests.sh
+        - ./tools/travis/checkAndUploadLogs.sh standalone
+      name: "Standalone Tests"
     - script:
         - ./tests/performance/preparation/deploy.sh
         - TERM=dumb ./tests/performance/wrk_tests/latency.sh "https://172.17.0.1:10001" "$(cat ansible/files/auth.guest)" ./tests/performance/preparation/actions/noop.js 2m

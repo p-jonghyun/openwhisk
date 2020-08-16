@@ -31,11 +31,6 @@ sudo pip install ansible==2.5.2
 sudo pip install jinja2==2.9.6
 ```
 
-#### Vagrant users
-Nothing to be done, Ansible is already installed during vagrant provisioning.
-You can skip setup and prereq steps as those have been done by vagrant for you.
-You may jump directly to [Deploying Using CouchDB](#deploying-using-couchdb)
-
 #### Docker for Mac users
 ```
 sudo easy_install pip
@@ -82,8 +77,8 @@ The following step must be executed once per development environment.
 It will generate the `hosts` configuration file based on your environment settings.
 
 The default configuration does not run multiple instances of core components (e.g., controller, invoker, kafka).
-You may elect to enable high-availability (HA) mode by passing tne ansible option `-e mode=HA` when executing this playbook.
-This will configure your deployment with multiple instances (e.g., two kafka instancess, and two invokers).
+You may elect to enable high-availability (HA) mode by passing tne Ansible option `-e mode=HA` when executing this playbook.
+This will configure your deployment with multiple instances (e.g., two Kafka instances, and two invokers).
 
 In addition to the host file generation, you need to configure the database for your deployment. This is done
 by modifying the file `ansible/db_local.ini` to provide the following properties.
@@ -98,7 +93,7 @@ db_host=
 db_port=
 ```
 
-This file is generated automatically for an ephermeral CouchDB instance during `setup.yml`. If you want to use Cloudant, you have to modify the file.
+This file is generated automatically for an ephemeral CouchDB instance during `setup.yml`. If you want to use Cloudant, you have to modify the file.
 For convenience, you can use shell environment variables that are read by the playbook to generate the required `db_local.ini` file as shown below.
 
 ```
@@ -196,31 +191,71 @@ ansible-playbook -i environments/<environment> routemgmt.yml
 - To use the API Gateway, you'll need to run `apigateway.yml` and `routemgmt.yml`.
 - Use `ansible-playbook -i environments/<environment> openwhisk.yml` to avoid wiping the data store. This is useful to start OpenWhisk after restarting your Operating System.
 
+### Using ElasticSearch to Store Activations
+
+You can use ElasticSearch (ES) to store activations separately while other entities remain stored in CouchDB. There is an Ansible playbook to setup a simple ES cluster for testing and development purposes.
+
+-   Provide your custom ES related ansible arguments:
+
+```
+elastic_protocol="http"
+elastic_index_pattern="openwhisk-%s" // this will be combined with namespace's name, so different namespace can use different index
+elastic_base_volume="esdata" // name of docker volume to store ES data
+elastic_cluster_name="openwhisk"
+elastic_java_opts="-Xms1g -Xmx1g"
+elastic_loglevel="INFO"
+elastic_username="admin"
+elastic_password="admin"
+elasticsearch_connect_string="x.x.x.x:9200,y.y.y.y:9200" // if you want to use an external ES cluster, add it
+```
+
+-  Then execute:
+
+```
+cd <openwhisk_home>
+./gradlew distDocker
+cd ansible
+# couchdb is still needed to store subjects and actions
+ansible-playbook -i environments/<environment> couchdb.yml
+ansible-playbook -i environments/<environment> initdb.yml
+ansible-playbook -i environments/<environment> wipe.yml
+# this will deploy a simple ES cluster, you can skip this to use external ES cluster
+ansible-playbook -i environments/<environment> elasticsearch.yml
+ansible-playbook -i environments/<environment> openwhisk.yml -e db_activation_backend=ElasticSearch
+
+# installs a catalog of public packages and actions
+ansible-playbook -i environments/<environment> postdeploy.yml
+
+# to use the API gateway
+ansible-playbook -i environments/<environment> apigateway.yml
+ansible-playbook -i environments/<environment> routemgmt.yml
+```
+
 ### Configuring the installation of `wsk` CLI
 There are two installation modes to install `wsk` CLI: remote and local.
 
 The mode "remote" means to download the `wsk` binaries from available web links.
 By default, OpenWhisk sets the installation mode to remote and downloads the
 binaries from the CLI
-[release page](https://github.com/apache/incubator-openwhisk-cli/releases),
+[release page](https://github.com/apache/openwhisk-cli/releases),
 where OpenWhisk publishes the official `wsk` binaries.
 
 The mode "local" means to build and install the `wsk` binaries from local CLI
 project. You can download the source code of OpenWhisk CLI
-[here](https://github.com/apache/incubator-openwhisk-cli).
+[here](https://github.com/apache/openwhisk-cli).
 Let's assume your OpenWhisk CLI home directory is
-`$OPENWHISK_HOME/../incubator-openwhisk-cli` and you've already `export`ed
+`$OPENWHISK_HOME/../openwhisk-cli` and you've already `export`ed
 `OPENWHISK_HOME` to be the root directory of this project. After you download
 the CLI repository, use the gradle command to build the binaries (you can omit
 the `-PnativeBuild` if you want to cross-compile for all supported platforms):
 
 ```
-cd "$OPENWHISK_HOME/../incubator-openwhisk-cli"
+cd "$OPENWHISK_HOME/../openwhisk-cli"
 ./gradlew releaseBinaries -PnativeBuild
 ```
 
 The binaries are generated and put into a tarball in the folder
-`../incubator-openwhisk-cli/release`.  Then, use the following ansible command
+`../openwhisk-cli/release`.  Then, use the following Ansible command
 to (re-)configure the CLI installation:
 
 ```
@@ -228,13 +263,13 @@ export OPENWHISK_ENVIRONMENT=local  # ... or whatever
 ansible-playbook -i environments/$OPENWHISK_ENVIRONMENT edge.yml -e mode=clean
 ansible-playbook -i environments/$OPENWHISK_ENVIRONMENT edge.yml \
     -e cli_installation_mode=local \
-    -e openwhisk_cli_home="$OPENWHISK_HOME/../incubator-openwhisk-cli"
+    -e openwhisk_cli_home="$OPENWHISK_HOME/../openwhisk-cli"
 ```
 
 The parameter `cli_installation_mode` specifies the CLI installation mode and
 the parameter `openwhisk_cli_home` specifies the home directory of your local
 OpenWhisk CLI.  (_n.b._ `openwhisk_cli_home` defaults to
-`$OPENWHISK_HOME/../incubator-openwhisk-cli`.)
+`$OPENWHISK_HOME/../openwhisk-cli`.)
 
 Once the CLI is installed, you can [use it to work with Whisk](../docs/cli.md).
 

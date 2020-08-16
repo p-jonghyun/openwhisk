@@ -18,10 +18,9 @@
 package org.apache.openwhisk.http
 
 import org.junit.runner.RunWith
-import org.scalatest.{FlatSpecLike, Matchers}
+import org.scalatest.{BeforeAndAfterAll, FlatSpecLike, Matchers}
 import org.scalatest.concurrent.ScalaFutures
 import org.scalatest.junit.JUnitRunner
-
 import akka.NotUsed
 import akka.actor.ActorSystem
 import akka.stream.scaladsl.Flow
@@ -32,16 +31,13 @@ import akka.http.scaladsl.model.HttpMethods.{GET, POST}
 import akka.http.scaladsl.model.StatusCodes.{InternalServerError, NotFound}
 import akka.http.scaladsl.model.headers.RawHeader
 import akka.http.scaladsl.unmarshalling.Unmarshaller.UnsupportedContentTypeException
-
 import common.StreamLogging
-
 import spray.json.JsObject
 import spray.json.DefaultJsonProtocol._
 
 import scala.concurrent.duration._
 import scala.concurrent.{Await, ExecutionContext, Future, Promise, TimeoutException}
 import scala.util.{Success, Try}
-
 import org.apache.openwhisk.http.PoolingRestClient._
 
 @RunWith(classOf[JUnitRunner])
@@ -49,10 +45,16 @@ class PoolingRestClientTests
     extends TestKit(ActorSystem("PoolingRestClientTests"))
     with FlatSpecLike
     with Matchers
+    with BeforeAndAfterAll
     with ScalaFutures
     with StreamLogging {
   implicit val ec: ExecutionContext = system.dispatcher
   implicit val materializer: ActorMaterializer = ActorMaterializer()
+
+  override def afterAll(): Unit = {
+    TestKit.shutdownActorSystem(system)
+    super.afterAll()
+  }
 
   def testFlow(httpResponse: HttpResponse = HttpResponse(), httpRequest: HttpRequest = HttpRequest())
     : Flow[(HttpRequest, Promise[HttpResponse]), (Try[HttpResponse], Promise[HttpResponse]), NotUsed] =
@@ -138,12 +140,15 @@ class PoolingRestClientTests
   }
 
   it should "return a status code on request failure" in {
-    val httpResponse = HttpResponse(NotFound)
+    val body = "Limit is too large, must not exceed 268435456"
+    val httpResponse = HttpResponse(NotFound, entity = body)
     val httpRequest = HttpRequest(entity = HttpEntity(ContentTypes.`application/json`, JsObject.empty.compactPrint))
     val poolingRestClient = new PoolingRestClient("https", "host", 443, 1, Some(testFlow(httpResponse, httpRequest)))
     val request = mkJsonRequest(GET, Uri./, JsObject.empty, List.empty)
 
-    await(poolingRestClient.requestJson[JsObject](request)) shouldBe Left(NotFound)
+    val reqResult = await(poolingRestClient.requestJson[JsObject](request))
+    reqResult shouldBe Left(NotFound)
+    reqResult.left.get.reason shouldBe s"${NotFound.reason} (details: ${body})"
   }
 
   it should "throw an unsupported content-type exception when unexpected content-type is returned" in {

@@ -1,5 +1,19 @@
-# Licensed to the Apache Software Foundation (ASF) under one or more contributor
-# license agreements; and to You under the Apache License, Version 2.0.
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
 ---
 # This role will run a CouchDB server on the db group
 
@@ -10,6 +24,10 @@
 - name: "Set the volumes"
   set_fact:
     volumes: []
+
+- name: "Set the nodes"
+  set_fact:
+    couchdb_nodes: []
 
 - name: check if db credentials are valid for CouchDB
   fail: msg="The db provider in your {{ hosts_dir }}/group_vars/all is {{ db.provider }}, it has to be CouchDB, pls double check"
@@ -88,6 +106,45 @@
     force_basic_auth: yes
   when: (create_users_db.status == 404) and (inventory_hostname == coordinator) and (couchdb.version is version_compare('2.0','>='))
 
+- name: check whether couchdb is clustered
+  uri:
+    url: "{{ db.protocol }}://{{ ansible_host }}:{{ db.port }}/_cluster_setup"
+    method: GET
+    status_code: 200
+    user: "{{ db.credentials.admin.user }}"
+    password: "{{ db.credentials.admin.pass }}"
+    force_basic_auth: yes
+  register: cluster_state
+  run_once: true
+
+- name: check clustered nodes
+  uri:
+    url: "{{ db.protocol }}://{{ ansible_host }}:{{ db.port }}/_membership"
+    method: GET
+    status_code: 200
+    user: "{{ db.credentials.admin.user }}"
+    password: "{{ db.credentials.admin.pass }}"
+    force_basic_auth: yes
+  register: nodes_state
+  run_once: true
+
+- name: generates couchdb node name
+  set_fact:
+    couchdb_nodes: "{{ couchdb_nodes }} + [ 'couchdb@{{ item }}' ]"
+  with_items: "{{ groups['db'] }}"
+  run_once: true
+
+- name: check if there is a new node
+  set_fact:
+    require_clustering: true
+  when: item not in nodes_state.json.cluster_nodes
+  with_items: "{{ couchdb_nodes }}"
+  run_once: true
+
+- name: set node name
+  set_fact:
+    node_name: "couchdb@{{ ansible_host }}"
+
 - name: enable the cluster setup mode
   uri:
     url: "{{ db.protocol }}://{{ ansible_host }}:{{ db.port }}/_cluster_setup"
@@ -99,7 +156,7 @@
     user: "{{ db.credentials.admin.user }}"
     password: "{{ db.credentials.admin.pass }}"
     force_basic_auth: yes
-  when: (inventory_hostname == coordinator) and (db.instances|int >= 2)
+  when: (inventory_hostname == coordinator) and (db.instances|int >= 2) and require_clustering is defined
 
 - name: add remote nodes to the cluster
   uri:
@@ -112,7 +169,7 @@
     user: "{{ db.credentials.admin.user }}"
     password: "{{ db.credentials.admin.pass }}"
     force_basic_auth: yes
-  when: (inventory_hostname != coordinator) and (db.instances|int >= 2)
+  when: (inventory_hostname != coordinator) and (db.instances|int >= 2)  and require_clustering is defined and node_name not in nodes_state.json.cluster_nodes
 
 - name: finish the cluster setup mode
   uri:
@@ -125,4 +182,5 @@
     user: "{{ db.credentials.admin.user }}"
     password: "{{ db.credentials.admin.pass }}"
     force_basic_auth: yes
-  when: (inventory_hostname == coordinator) and (db.instances|int >= 2)
+  when: (inventory_hostname == coordinator) and (db.instances|int >= 2) and (cluster_state.json.state != "cluster_finished")
+

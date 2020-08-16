@@ -1,5 +1,19 @@
-# Licensed to the Apache Software Foundation (ASF) under one or more contributor
-# license agreements; and to You under the Apache License, Version 2.0.
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
 ---
 # This role will install Controller in group 'controllers' in the environment
 # inventory
@@ -118,6 +132,10 @@
       -Dcom.sun.management.jmxremote.rmi.port={{ jmx_remote_rmi_port }}
       -Dcom.sun.management.jmxremote.port={{ jmx_remote_port }}
 
+- name: Load config from template
+  set_fact:
+      openwhisk_config: "{{ lookup('template', 'config.j2') | b64encode }}"
+
 - name: populate environment variables for controller
   set_fact:
     env:
@@ -129,10 +147,9 @@
         -XX:+HeapDumpOnOutOfMemoryError
         -XX:HeapDumpPath=/logs
       "CONTROLLER_OPTS": "{{ controller_args | default(controller.arguments) }}"
-      "CONTROLLER_INSTANCES": "{{ controller.instances }}"
       "JMX_REMOTE": "{{ jmx.enabled }}"
-
-      "PORT": 8080
+      "OPENWHISK_ENCODED_CONFIG": "{{ openwhisk_config }}"
+      "PORT": "8080"
       "TZ": "{{ docker.timezone }}"
 
       "CONFIG_whisk_info_date": "{{ whisk.version.date }}"
@@ -180,10 +197,11 @@
       "CONFIG_whisk_couchdb_databases_WhiskEntity": "{{ db.whisk.actions }}"
       "CONFIG_whisk_couchdb_databases_WhiskActivation":
         "{{ db.whisk.activations }}"
+      "CONFIG_whisk_db_subjectsDdoc": "{{ db_whisk_subjects_ddoc | default() }}"
       "CONFIG_whisk_db_actionsDdoc": "{{ db_whisk_actions_ddoc | default() }}"
       "CONFIG_whisk_db_activationsDdoc": "{{ db_whisk_activations_ddoc | default() }}"
       "CONFIG_whisk_db_activationsFilterDdoc": "{{ db_whisk_activations_filter_ddoc | default() }}"
-      "CONFIG_whisk_userEvents_enabled": "{{ user_events }}"
+      "CONFIG_whisk_userEvents_enabled": "{{ user_events | default(false) | lower }}"
 
       "LIMITS_ACTIONS_INVOKES_PERMINUTE": "{{ limits.invocationsPerMinute }}"
       "LIMITS_ACTIONS_INVOKES_CONCURRENT": "{{ limits.concurrentInvocations }}"
@@ -202,6 +220,8 @@
       "CONFIG_whisk_concurrencyLimit_max": "{{ limit_action_concurrency_max | default() }}"
       "CONFIG_whisk_concurrencyLimit_std": "{{ limit_action_concurrency_std | default() }}"
 
+      "CONFIG_whisk_featureFlags_requireApiKeyAnnotation": "{{ whisk.feature_flags.require_api_key_annotation | default(true) | lower }}"
+
       "CONFIG_whisk_activation_payload_max":
         "{{ limit_activation_payload | default() }}"
 
@@ -211,13 +231,13 @@
       "CONFIG_whisk_runtimes_defaultImageTag":
         "{{ runtimes_default_image_tag | default() }}"
       "CONFIG_whisk_runtimes_bypassPullForLocalImages":
-        "{{ runtimes_bypass_pull_for_local_images | default() }}"
+        "{{ runtimes_bypass_pull_for_local_images | default() | lower }}"
       "CONFIG_whisk_runtimes_localImagePrefix":
         "{{ runtimes_local_image_prefix | default() }}"
 
-      "METRICS_KAMON": "{{ metrics.kamon.enabled }}"
-      "METRICS_KAMON_TAGS": "{{ metrics.kamon.tags }}"
-      "METRICS_LOG": "{{ metrics.log.enabled }}"
+      "METRICS_KAMON": "{{ metrics.kamon.enabled | default(false) | lower }}"
+      "METRICS_KAMON_TAGS": "{{ metrics.kamon.tags | default() | lower }}"
+      "METRICS_LOG": "{{ metrics.log.enabled | default(false) | lower }}"
       "CONFIG_whisk_controller_protocol": "{{ controller.protocol }}"
       "CONFIG_whisk_controller_https_keystorePath":
         "/conf/{{ controller.ssl.keystore.name }}"
@@ -233,6 +253,8 @@
         "{{ controller.blackboxFraction }}"
       "CONFIG_whisk_loadbalancer_timeoutFactor":
         "{{ controller.timeoutFactor }}"
+      "CONFIG_whisk_loadbalancer_timeoutAddon":
+        "{{ controller.timeoutAddon }}"
 
       "CONFIG_kamon_statsd_hostname": "{{ metrics.kamon.host }}"
       "CONFIG_kamon_statsd_port": "{{ metrics.kamon.port }}"
@@ -247,11 +269,27 @@
 
       "CONFIG_whisk_transactions_header": "{{ transactions.header }}"
 
-      "CONFIG_whisk_controller_activation_pollingFromDb": "{{ controller_activation_pollingFromDb | default(true) }}"
+      "CONFIG_whisk_controller_activation_pollingFromDb": "{{ controller_activation_pollingFromDb | default(true) | lower }}"
 
 - name: merge extra env variables
   set_fact:
     env: "{{ env | combine(controller.extraEnv) }}"
+
+- name: setup elasticsearch activation store env
+  set_fact:
+    elastic_env:
+      "CONFIG_whisk_activationStore_elasticsearch_protocol": "{{ db.elasticsearch.protocol}}"
+      "CONFIG_whisk_activationStore_elasticsearch_hosts": "{{ elasticsearch_connect_string }}"
+      "CONFIG_whisk_activationStore_elasticsearch_indexPattern": "{{ db.elasticsearch.index_pattern }}"
+      "CONFIG_whisk_activationStore_elasticsearch_username": "{{ db.elasticsearch.auth.admin.username }}"
+      "CONFIG_whisk_activationStore_elasticsearch_password": "{{ db.elasticsearch.auth.admin.password }}"
+      "CONFIG_whisk_spi_ActivationStoreProvider": "org.apache.openwhisk.core.database.elasticsearch.ElasticSearchActivationStoreProvider"
+  when: db.activation_store.backend == "ElasticSearch"
+
+- name: merge elasticsearch activation store env
+  set_fact:
+    env: "{{ env | combine(elastic_env) }}"
+  when: db.activation_store.backend == "ElasticSearch"
 
 - name: populate volumes for controller
   set_fact:
@@ -324,5 +362,3 @@
   until: result.status == 200
   retries: 12
   delay: 5
-
-# VIM: let b:syntastic_yaml_yamllint_args="-c '".expand('%:p:h')."../../../yamllint.yml'"

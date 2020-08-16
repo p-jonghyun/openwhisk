@@ -16,7 +16,7 @@
  * limitations under the License.
  */
 
-node('xenial&&!H21&&!H22&&!H11&&!ubuntu-eu3') {
+node('openwhisk1||openwhisk2||openwhisk3') {
   sh "env"
   sh "docker version"
   sh "docker info"
@@ -29,10 +29,11 @@ node('xenial&&!H21&&!H22&&!H11&&!ubuntu-eu3') {
       withCredentials([usernamePassword(credentialsId: 'openwhisk_dockerhub', passwordVariable: 'DOCKER_PASSWORD', usernameVariable: 'DOCKER_USER')]) {
           sh 'docker login -u ${DOCKER_USER} -p ${DOCKER_PASSWORD}'
       }
-      def PUSH_CMD = "./gradlew :core:controller:distDocker :core:invoker:distDocker :tools:ow-utils:distDocker -PdockerRegistry=docker.io -PdockerImagePrefix=openwhisk"
+      def PUSH_CMD = "./gradlew :core:controller:distDocker :core:invoker:distDocker :core:standalone:distDocker :core:monitoring:user-events:distDocker :tools:ow-utils:distDocker :core:cosmos:cache-invalidator:distDocker -PdockerRegistry=docker.io -PdockerImagePrefix=openwhisk"
       def gitCommit = sh(returnStdout: true, script: 'git rev-parse HEAD').trim()
       def shortCommit = gitCommit.take(7)
-      sh "${PUSH_CMD} -PdockerImageTag=latest"
+      sh "./gradlew clean"
+      sh "${PUSH_CMD} -PdockerImageTag=nightly"
       sh "${PUSH_CMD} -PdockerImageTag=${shortCommit}"
     }
   }

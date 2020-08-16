@@ -24,6 +24,7 @@ import akka.event.Logging.InfoLevel
 import akka.stream.scaladsl.Source
 import akka.util.ByteString
 import pureconfig._
+import pureconfig.generic.auto._
 import spray.json.DefaultJsonProtocol._
 import spray.json.JsObject
 import org.apache.openwhisk.common.{Logging, LoggingMarkers, TransactionId}
@@ -47,6 +48,7 @@ case class ContainerId(asString: String) {
 }
 case class ContainerAddress(host: String, port: Int = 8080) {
   require(host.nonEmpty, "ContainerIp must not be empty")
+  def asString() = s"${host}:${port}"
 }
 
 object Container {
@@ -71,7 +73,7 @@ trait Container {
 
   implicit protected val as: ActorSystem
   protected val id: ContainerId
-  protected val addr: ContainerAddress
+  protected[core] val addr: ContainerAddress
   protected implicit val logging: Logging
   protected implicit val ec: ExecutionContext
 
@@ -81,6 +83,8 @@ trait Container {
   /** maxConcurrent+timeout are cached during first init, so that resuming connections can reference */
   protected var containerHttpMaxConcurrent: Int = 1
   protected var containerHttpTimeout: FiniteDuration = 60.seconds
+
+  def containerId: ContainerId = id
 
   /** Stops the container from consuming CPU cycles. NOT thread-safe - caller must synchronize. */
   def suspend()(implicit transid: TransactionId): Future[Unit] = {
@@ -146,8 +150,11 @@ trait Container {
   }
 
   /** Runs code in the container. Thread-safe - caller may invoke concurrently for concurrent activation processing. */
-  def run(parameters: JsObject, environment: JsObject, timeout: FiniteDuration, maxConcurrent: Int)(
-    implicit transid: TransactionId): Future[(Interval, ActivationResponse)] = {
+  def run(parameters: JsObject,
+          environment: JsObject,
+          timeout: FiniteDuration,
+          maxConcurrent: Int,
+          reschedule: Boolean = false)(implicit transid: TransactionId): Future[(Interval, ActivationResponse)] = {
     val actionName = environment.fields.get("action_name").map(_.convertTo[String]).getOrElse("")
     val start =
       transid.started(
@@ -158,7 +165,7 @@ trait Container {
 
     val parameterWrapper = JsObject("value" -> parameters)
     val body = JsObject(parameterWrapper.fields ++ environment.fields)
-    callContainer("/run", body, timeout, maxConcurrent, retry = false)
+    callContainer("/run", body, timeout, maxConcurrent, retry = false, reschedule)
       .andThen { // never fails
         case Success(r: RunResult) =>
           transid.finished(
@@ -190,12 +197,14 @@ trait Container {
    * @param body body to send
    * @param timeout timeout of the request
    * @param retry whether or not to retry the request
+   * @param reschedule throw a reschedule error in case of connection failure
    */
   protected def callContainer(path: String,
                               body: JsObject,
                               timeout: FiniteDuration,
                               maxConcurrent: Int,
-                              retry: Boolean = false)(implicit transid: TransactionId): Future[RunResult] = {
+                              retry: Boolean = false,
+                              reschedule: Boolean = false)(implicit transid: TransactionId): Future[RunResult] = {
     val started = Instant.now()
     val http = httpConnection.getOrElse {
       val conn = openConnections(timeout, maxConcurrent)
@@ -203,7 +212,7 @@ trait Container {
       conn
     }
     http
-      .post(path, body, retry)
+      .post(path, body, retry, reschedule)
       .map { response =>
         val finished = Instant.now()
         RunResult(Interval(started, finished), response)
@@ -211,12 +220,19 @@ trait Container {
   }
   private def openConnections(timeout: FiniteDuration, maxConcurrent: Int) = {
     if (Container.config.akkaClient) {
-      new AkkaContainerClient(addr.host, addr.port, timeout, ActivationEntityLimit.MAX_ACTIVATION_ENTITY_LIMIT, 1024)
+      new AkkaContainerClient(
+        addr.host,
+        addr.port,
+        timeout,
+        ActivationEntityLimit.MAX_ACTIVATION_ENTITY_LIMIT,
+        ActivationEntityLimit.MAX_ACTIVATION_ENTITY_TRUNCATION_LIMIT,
+        1024)
     } else {
       new ApacheBlockingContainerClient(
         s"${addr.host}:${addr.port}",
         timeout,
         ActivationEntityLimit.MAX_ACTIVATION_ENTITY_LIMIT,
+        ActivationEntityLimit.MAX_ACTIVATION_ENTITY_TRUNCATION_LIMIT,
         maxConcurrent)
     }
   }
@@ -244,12 +260,15 @@ case class BlackboxStartupError(msg: String) extends ContainerStartupError(msg)
 /** Indicates an error while initializing a container */
 case class InitializationError(interval: Interval, response: ActivationResponse) extends Exception(response.toString)
 
+/** Indicates a connection error after resuming a container */
+case class ContainerHealthError(tid: TransactionId, msg: String) extends Exception(msg)
+
 case class Interval(start: Instant, end: Instant) {
   def duration = Duration.create(end.toEpochMilli() - start.toEpochMilli(), MILLISECONDS)
 }
 
 case class RunResult(interval: Interval, response: Either[ContainerConnectionError, ContainerResponse]) {
-  def ok = response.right.exists(_.ok)
+  def ok = response.exists(_.ok)
   def toBriefString = response.fold(_.toString, _.toString)
 }
 

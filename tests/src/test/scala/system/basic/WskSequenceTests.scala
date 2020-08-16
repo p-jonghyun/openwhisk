@@ -20,7 +20,7 @@ package system.basic
 import java.time.Instant
 import java.util.Date
 
-import com.jayway.restassured.RestAssured
+import io.restassured.RestAssured
 
 import scala.concurrent.duration.DurationInt
 import scala.language.postfixOps
@@ -30,10 +30,11 @@ import org.scalatest.junit.JUnitRunner
 import common._
 import common.TestUtils._
 import common.rest.WskRestOperations
+import org.apache.openwhisk.core.entity.WhiskActivation
 import spray.json._
 import spray.json.DefaultJsonProtocol._
 import system.rest.RestUtil
-import org.apache.openwhisk.http.Messages.sequenceIsTooLong
+import org.apache.openwhisk.http.Messages._
 
 /**
  * Tests sequence execution
@@ -298,6 +299,54 @@ class WskSequenceTests extends TestHelpers with WskTestHelpers with StreamLoggin
         new Regex(String.format(".*key0: value0.*key1a: value1a.*key1b: value2b.*key2a: value2a.*payload: %s", now)))
   }
 
+  it should "contain an binding annotation if invoked action is in a package binding" in withAssetCleaner(wskprops) {
+    (wp, assetHelper) =>
+      val ns = wsk.namespace.whois()
+      val packageName = "package1"
+      val bindName = "package2"
+      val actionName = "print"
+      val packageActionName = packageName + "/" + actionName
+      val bindActionName = bindName + "/" + actionName
+
+      val file = TestUtils.getTestActionFilename("echo.js")
+      assetHelper.withCleaner(wsk.pkg, packageName) { (pkg, _) =>
+        pkg.create(packageName)
+      }
+      assetHelper.withCleaner(wsk.action, packageActionName) { (action, _) =>
+        action.create(packageActionName, Some(file))
+      }
+      assetHelper.withCleaner(wsk.pkg, bindName) { (pkg, _) =>
+        pkg.bind(packageName, bindName)
+      }
+      // sequence
+      val sequenceActionName = "sequenceWithBinding"
+      val sName = packageName + "/" + sequenceActionName
+      val bName = bindName + "/" + sequenceActionName
+      assetHelper.withCleaner(wsk.action, sName) { (action, seqName) =>
+        action.create(seqName, Some(bindActionName), kind = Some("sequence"))
+      }
+
+      val run = wsk.action.invoke(bName)
+      withActivation(wsk.activation, run, totalWait = 2 * allowedActionDuration) { activation =>
+        val binding = activation.getAnnotationValue(WhiskActivation.bindingAnnotation)
+        binding shouldBe defined
+        binding.get shouldBe JsString(ns + "/" + bindName)
+
+        for (id <- activation.logs.get) {
+          withActivation(
+            wsk.activation,
+            id,
+            initialWait = 1 second,
+            pollPeriod = 60 seconds,
+            totalWait = allowedActionDuration) { componentActivation =>
+            val binding = componentActivation.getAnnotationValue(WhiskActivation.bindingAnnotation)
+            binding shouldBe defined
+            binding.get shouldBe JsString(ns + "/" + bindName)
+          }
+        }
+      }
+  }
+
   /**
    * s -> apperror, echo
    * only apperror should run
@@ -365,9 +414,9 @@ class WskSequenceTests extends TestHelpers with WskTestHelpers with StreamLoggin
         // the status should be error
         //activation.response.status shouldBe("application error")
         val result = activation.response.result.get
-        // the result of the activation should be timeout
-        result shouldBe (JsObject(
-          "error" -> JsString("The action exceeded its time limits of 10000 milliseconds during initialization.")))
+        // the result of the activation should be timeout or an abnormal initialization
+        result should (be(JsObject("error" -> timedoutActivation(shortDuration, true).toJson)) or be(
+          JsObject("error" -> abnormalInitialization.toJson)))
       }
   }
 
@@ -490,6 +539,9 @@ class WskSequenceTests extends TestHelpers with WskTestHelpers with StreamLoggin
         totalWait = allowedActionDuration) { componentActivation =>
         componentActivation.cause shouldBe defined
         componentActivation.cause.get shouldBe (activation.activationId)
+        // check waitTime
+        val waitTime = componentActivation.getAnnotationValue("waitTime")
+        waitTime shouldBe defined
         // check causedBy
         val causedBy = componentActivation.getAnnotationValue("causedBy")
         causedBy shouldBe defined
@@ -509,7 +561,7 @@ class WskSequenceTests extends TestHelpers with WskTestHelpers with StreamLoggin
   }
 
   /** checks that the logs of the idx-th atomic action from a sequence contains logsStr */
-  private def checkLogsAtomicAction(atomicActionIdx: Int, run: RunResult, regex: Regex) {
+  private def checkLogsAtomicAction(atomicActionIdx: Int, run: RunResult, regex: Regex): Unit = {
     withActivation(wsk.activation, run, totalWait = 2 * allowedActionDuration) { activation =>
       checkSequenceLogsAndAnnotations(activation, 1)
       val componentId = activation.logs.get(atomicActionIdx)

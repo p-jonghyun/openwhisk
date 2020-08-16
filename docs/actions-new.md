@@ -59,9 +59,9 @@ Further, you should automate and pass the following test suites:
 ### The runtimes manifest
 
 Actions when created specify the desired runtime for the function via a property called "kind".
-When using the `wsk` CLI, this is specified as `--kind <runtime-kind>`. The value is a typically
+When using the `wsk` CLI, this is specified as `--kind <runtime-kind>`. The value is typically
 a string describing the language (e.g., `nodejs`) followed by a colon and the version for the runtime
-as in `nodejs:8` or `php:7.3`.
+as in `nodejs:10` or `php:7.4`.
 
 The manifest is a map of runtime family names to an array of specific kinds. The details of the
 schema are found in the [Exec Manifest](../common/scala/src/main/scala/org/apache/openwhisk/core/entity/ExecManifest.scala).
@@ -103,7 +103,7 @@ The runtime repository should follow the canonical structure used by other runti
         └── ...          # ... which extend canonical interface plus additional runtime specific tests
 ```
 
-The [Docker skeleton repository](https://github.com/apache/incubator-openwhisk-runtime-docker)
+The [Docker skeleton repository](https://github.com/apache/openwhisk-runtime-docker)
 is an example starting point to fork and modify for your new runtime.
 
 ### The test action
@@ -113,7 +113,7 @@ new language and added to the [test artifacts directory](../tests/dat/actions/un
 with the name `<runtime-kind>.txt` for plain text file or `<runtime-kind>.bin` for a
 a binary file. The `<runtime-kind>` must match the value used for `kind` in the corresponding
 runtime manifest entry, replacing `:` in the kind with a `-`.
-For example, a plain text function for `nodejs:8` becomes `nodejs-8.txt`.
+For example, a plain text function for `nodejs:10` becomes `nodejs-10.txt`.
 
 ```js
 function main(args) {
@@ -146,7 +146,8 @@ The initialization route is `/init`. It must accept a `POST` request with a JSON
     "name" : String,
     "main" : String,
     "code" : String,
-    "binary": Boolean
+    "binary": Boolean,
+    "env": Map[String, String]
   }
 }
 ```
@@ -155,10 +156,19 @@ The initialization route is `/init`. It must accept a `POST` request with a JSON
 * `main` is the name of the function to execute.
 * `code` is either plain text or a base64 encoded string for binary functions (i.e., a compiled executable).
 * `binary` is false if `code` is in plain text, and true if `code` is base64 encoded.
+* `env` is a map of key-value pairs of properties to export to the environment. And contains several properties starting with the `__OW_` prefix that are specific to the running action.
+  * `__OW_API_KEY` the API key for the subject invoking the action, this key may be a restricted API key. This property is absent unless explicitly [requested](./annotations.md#annotations-for-all-actions).
+  * `__OW_NAMESPACE` the namespace for the _activation_ (this may not be the same as the namespace for the action).
+  * `__OW_ACTION_NAME` the fully qualified name of the running action.
+  * `__OW_ACTION_VERSION` the internal version number of the running action.
+  * `__OW_ACTIVATION_ID` the activation id for this running action instance.
+  * `__OW_DEADLINE` the approximate time when this initializer will have consumed its entire duration quota (measured in epoch milliseconds).
+
 
 The initialization route is called exactly once by the OpenWhisk platform, before executing a function.
 The route should report an error if called more than once. It is possible however that a single initialization
-will be followed by many activations (via `/run`).
+will be followed by many activations (via `/run`). If an `env` property is provided, the corresponding environment
+variables should be defined before the action code is initialized.
 
 **Successful initialization:** The route should respond with `200 OK` if the initialization is successful and
 the function is ready to execute. Any content provided in the response is ignored.
@@ -196,6 +206,7 @@ platform follows the following schema:
   "api_host": String,
   "api_key": String,
   "activation_id": String,
+  "transaction_id": String,
   "deadline": Number
 }
 ```
@@ -204,6 +215,7 @@ platform follows the following schema:
 * `namespace` is the OpenWhisk namespace for the action (e.g., `whisk.system`).
 * `action_name` is the [fully qualified name](reference.md#fully-qualified-names) of the action.
 * `activation_id` is a unique ID for this activation.
+* `transaction_id` is a unique ID for the request of which this activation is part of.
 * `deadline` is the deadline for the function.
 * `api_key` is the API key used to invoke the action.
 
@@ -232,7 +244,7 @@ will destroy the container.
 
 The proxy must flush all the logs produced during initialization and execution and add a frame marker
 to denote the end of the log stream for an activation. This is done by emitting the token
-[`XXX_THE_END_OF_A_WHISK_ACTIVATION_XXX`](https://github.com/apache/incubator-openwhisk/blob/59abfccf91b58ee39f184030374203f1bf372f2d/core/invoker/src/main/scala/whisk/core/containerpool/docker/DockerContainer.scala#L51)
+[`XXX_THE_END_OF_A_WHISK_ACTIVATION_XXX`](https://github.com/apache/openwhisk/blob/59abfccf91b58ee39f184030374203f1bf372f2d/core/invoker/src/main/scala/whisk/core/containerpool/docker/DockerContainer.scala#L51)
 as the last log line for the `stdout` _and_ `stderr` streams. Failure to emit this marker will cause delayed
 or truncated activation logs.
 
@@ -249,10 +261,11 @@ runtime should extend this test suite, and of course include additional tests as
 There is a [canonical test harness](../tests/src/test/scala/actionContainers/BasicActionRunnerTests.scala)
 for validating a new runtime.
 
-The harness will performing the following:
+The tests verify that the proxy can handle the following scenarios:
 * Test the proxy can handle the identity functions (initialize and run).
-* Test the proxy can properly handle functions with Unicode characters.
+* Test the proxy can handle pre-defined environment variables as well as initialization parameters.
 * Test the proxy properly constructs the activation context.
+* Test the proxy can properly handle functions with Unicode characters.
 * Test the proxy can handle large payloads (more than 1MB).
 * Test the proxy can handle an entry point other than "main".
 * Test the proxy does not permit re-initialization.
@@ -269,3 +282,11 @@ other OpenWhisk clients. In which case, appropriate tests should be added as nec
 The OpenWhisk platform will perform a generic integration test as part of its basic
 system tests. This integration test will require a [test function](#the-test-action) to
 be available so that the test harness can create, invoke, and delete the action.
+
+### Supporting Additonal Execution Environments
+
+There are now several runtimes that support execution environments in addition to OpenWhisk. Currently only an interface for single entrypoint execution environments has been defined, but more could be defined in the future.
+
+#### Action Proxy Single Entrypoint Interface
+
+Single entrypoint proxies are proxies that have only onde addressable http endpoint. They do not use `/init` and `/run` enpoints utilized by standard OpenWhisk runtime environments; instead both the initialization and activation are handled through one endpoint. The first example of such a proxy was implemented for Knative Serving, but the same interface can be used for any single entrypoint execution environment. In an effort to standardize how the various action proxy implementation containers are able to handle single entrypoint execution environments (such as Knative Serving), there is a description of the contract and example cases outlining how a container should respond with a given input. The descriptions and example cases are documented in [Single Entrypoint Proxy Contract](single_entrypoint_proxy_contract.md).

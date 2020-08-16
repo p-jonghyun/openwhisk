@@ -47,14 +47,15 @@ object Attachments {
 
   // Attachments are considered free because the name/content type are system determined
   // and a size check for the content is done during create/update
-  implicit class SizeAttachment[T <% SizeConversion](a: Attachment[T]) extends SizeConversion {
+  implicit class SizeAttachment[T](a: Attachment[T])(implicit ev: T => SizeConversion) extends SizeConversion {
     def sizeIn(unit: SizeUnits.Unit): ByteSize = a match {
       case Inline(v) => (v: SizeConversion).sizeIn(unit)
       case _         => 0.bytes
     }
   }
 
-  implicit class OptionSizeAttachment[T <% SizeConversion](a: Option[Attachment[T]]) extends SizeConversion {
+  implicit class OptionSizeAttachment[T](a: Option[Attachment[T]])(implicit ev: T => SizeConversion)
+      extends SizeConversion {
     def sizeIn(unit: SizeUnits.Unit): ByteSize = a match {
       case Some(Inline(v)) => (v: SizeConversion).sizeIn(unit)
       case _               => 0.bytes
@@ -65,13 +66,12 @@ object Attachments {
     implicit val serdes = {
       implicit val contentTypeSerdes = new RootJsonFormat[ContentType] {
         override def write(c: ContentType) = JsString(c.value)
-        override def read(js: JsValue) =
-          Try {
-            val JsString(c) = js
-            ContentType.parse(c).right.get
-          } getOrElse {
+
+        override def read(js: JsValue): ContentType = {
+          Try(js.convertTo[String]).toOption.flatMap(ContentType.parse(_).toOption).getOrElse {
             throw new DeserializationException("Could not deserialize content-type")
           }
+        }
       }
 
       jsonFormat4(Attached.apply)

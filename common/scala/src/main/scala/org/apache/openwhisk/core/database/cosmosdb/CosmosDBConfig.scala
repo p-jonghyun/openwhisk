@@ -18,6 +18,7 @@
 package org.apache.openwhisk.core.database.cosmosdb
 import com.microsoft.azure.cosmosdb.rx.AsyncDocumentClient
 import com.microsoft.azure.cosmosdb.{
+  ConnectionMode,
   ConsistencyLevel,
   ConnectionPolicy => JConnectionPolicy,
   RetryOptions => JRetryOptions
@@ -26,6 +27,7 @@ import com.typesafe.config.Config
 import com.typesafe.config.ConfigUtil.joinPath
 import org.apache.openwhisk.core.ConfigKeys
 import pureconfig._
+import pureconfig.generic.auto._
 
 import scala.collection.JavaConverters._
 import scala.concurrent.duration._
@@ -36,7 +38,10 @@ case class CosmosDBConfig(endpoint: String,
                           throughput: Int,
                           consistencyLevel: ConsistencyLevel,
                           connectionPolicy: ConnectionPolicy,
-                          timeToLive: Option[Duration]) {
+                          timeToLive: Option[Duration],
+                          clusterId: Option[String],
+                          softDeleteTTL: Option[FiniteDuration],
+                          recordUsageFrequency: Option[FiniteDuration]) {
 
   def createClient(): AsyncDocumentClient = {
     new AsyncDocumentClient.Builder()
@@ -51,13 +56,15 @@ case class CosmosDBConfig(endpoint: String,
 case class ConnectionPolicy(maxPoolSize: Int,
                             preferredLocations: Seq[String],
                             usingMultipleWriteLocations: Boolean,
-                            retryOptions: RetryOptions) {
+                            retryOptions: RetryOptions,
+                            connectionMode: ConnectionMode) {
   def asJava: JConnectionPolicy = {
     val p = new JConnectionPolicy
     p.setMaxPoolSize(maxPoolSize)
     p.setUsingMultipleWriteLocations(usingMultipleWriteLocations)
     p.setPreferredLocations(preferredLocations.asJava)
     p.setRetryOptions(retryOptions.asJava)
+    p.setConnectionMode(connectionMode)
     p
   }
 }

@@ -96,6 +96,10 @@ Histogram record the [distribution](http://kamon.io/documentation/0.6.x/kamon-co
 * `my_metric.max` - Max of aggregated values during the flush interval.
 * `my_metric.min` - Min of aggregated values during the flush interval.
 
+#### Gauges
+
+Gauges record the [distribution](https://kamon.io/docs/latest/core/metrics/#gauges) of given metric and their names are prefixed with `openwhisk.gauge`. For example `openwhisk.gauge.loadbalancer_totalHealthyInvoker_counter`. A gauge metrics provides the value at the given point and reports the same data unless the value has been changed be incremental or decremental than before. Gauges are useful for reporting metrics like kafka queue size or disk size.
+
 ### Metric Details
 
 Below are some of the important metrics emitted by OpenWhisk setup
@@ -106,13 +110,13 @@ Metrics below are emitted from within a Controller instance.
 
 ##### Controller Startup
 
-* `openwhisk.counter.controller_startup<controller_id>_count` (counter)
-  * Example _openwhisk.counter.controller_startup0_count_
+* `openwhisk.counter.controller_startup<controller_id>_counter` (counter)
+  * Example _openwhisk.counter.controller_startup0_counter_
   * Records count of controller instance startup
 
 ##### Controller Activation Retrieval During Blocking Invocations
 
-* `openwhisk.counter.controller_blockingActivationDatabaseRetrieval_count` (counter) - Records the count of activations the controller has retrieved from the activation store during blocking invocations
+* `openwhisk.counter.controller_blockingActivationDatabaseRetrieval_counter` (counter) - Records the count of activations the controller has retrieved from the activation store during blocking invocations
 
 ##### Activation Submission
 
@@ -129,12 +133,16 @@ Following metrics record stats around activation handling within Controller
 
 Aggregate metrics for inflight activations.
 
-* `openwhisk.histogram.loadbalancer<controllerId>_activationsInflight_count` (histogram) - Records the number of activations being worked upon for a given controller. As a histogram it would give a distribution of inflight activation count within a flush interval.
-* `openwhisk.histogram.loadbalancer<controllerId>_memoryInflight_count` (histogram) - Records the amount of RAM memory in use for in flight activations. This is not actual runtime memory but the memory specified per action limits.
+* `openwhisk.gauge.loadbalancer<controllerId>_activationsInflight_counter` (gauge) - Records the number of activations being worked upon for a given controller. As a gauge this will give inflight activation count at the given point in time unless the change in value occurs.
+* `openwhisk.gauge.loadbalancer<controllerId>_memory<invokerType>Inflight_counter` (gauge) - Records the amount of RAM memory in use for in flight activations. This is not actual runtime memory but the memory specified per action limits. **invokerType** defines whether it is a managed or a blackbox invoker.
+
+Metrics below are for current memory capacity
+
+* `openwhisk.histogram.loadbalancer_totalCapacity<invokerType>_counter` (histogram) - Current memory capacity for all usable managed and blackbox invokers, total user memory in shard managed by controller. **invokerType** defines whether it is a managed or a blackbox invoker.
 
 Metrics below are captured within load balancer
 
-* `openwhisk.counter.loadbalancer_activations_count` (counter) -  Records the count of activations sent to Kafka.
+* `openwhisk.counter.loadbalancer_activations_counter` (counter) -  Records the count of activations sent to Kafka.
 * `openwhisk.counter.controller_kafka_start` (counter) - Records the count of activations sent to Kafka.
 * `openwhisk.counter.controller_kafka_error` (counter) - Records the count of activations which encountered some failure while submitting to Kafka.
 * `openwhisk.histogram.controller_kafka_finish` (histogram) - Records the time taken when activation was successfully submitted to Kafka.
@@ -144,8 +152,22 @@ Metrics below are captured within load balancer
 
 Metrics below are for invoker state as recorded within load balancer monitoring.
 
-* `openwhisk.counter.loadbalancer_invokerOffline_count` - Records the count of invokers considered offline based on health pings.
-* `openwhisk.counter.loadbalancer_invokerUnhealthy_count` - Records the count of invokers considered unhealthy based on health pings.
+* `openwhisk.gauge.loadbalancer_totalHealthyInvoker<invokerType>_counter`(gauge) - Records the count of managed invokers considered healthy based on health pings. **invokerType** defines whether it is a managed or a blackbox invoker.
+* `openwhisk.gauge.loadbalancer_totalUnresponsiveInvoker<invokerType>_counter` (gauge) - Records the count of managed invokers considered unresponsive when health pings arriving fine but the invokers do not respond with active-acks in given time. **invokerType** defines whether it is a managed or a blackbox invoker.
+* `openwhisk.gauge.loadbalancer_totalOfflineInvoker<invokerType>_counter` (gauge) - Records the count of managed invokers considered offline when no health pings arrive from the invokers. **invokerType** defines whether it is a managed or a blackbox invoker.
+* `openwhisk.gauge.loadbalancer_totalUnhealthyInvoker<invokerType>_counter` (gauge) - Records the count of managed invokers considered unhealthy when health pings arrive fine but the invokers report system errors. **invokerType** defines whether it is a managed or a blackbox invoker.
+
+Metrics below provide information about completion ack processing in load balancers. Depending on configuration setting `metrics_kamon_tags` (see above), a base metric with tags or a set of metrics without tags will be emitted.
+
+* Base metric `openwhisk.counter.loadbalancer_completionAck_counter`: count of processed regular or forced completion acks.
+* Tag `controller_id`: the controller's id.
+* Tag `type`: the exact type of completion ack.
+  * Type `regular`: a regular completion ack sent by an invoker and received in time. Does not include completion acks for healthcheck actions.
+  * Type `forced`: no completion ack was received in time and the timeout forced the completion ack to close.
+  * Type `healthcheck`: a regular completion ack for healthcheck actions sent by an invoker and received in time.
+  * Type `regularAfterForced`: a regular completion ack sent by an invoker and not received in time. The completion ack was already forced.
+  * Type `forcedAfterRegular`: a timeout tries to force a completion ack that has already been closed by a regular completion ack. A race condition that can occur if the regular completion ack is received near the timeout.
+* If `metrics_kamon_tags` is set to `false`, a set of metrics will be emitted constructed using following scheme: `openwhisk.counter.loadbalancer<controller_id>_completionAck_<type>_counter`.
 
 #### Invoker metrics
 
@@ -163,9 +185,9 @@ Metrics below are for invoker state as recorded within load balancer monitoring.
 
 ##### Container Start
 
-* `openwhisk.counter.invoker_containerStart.cold_count` (counter) - Count of number of cold starts.
-* `openwhisk.counter.invoker_containerStart.recreated_count` (counter) - Count of number of times container is recreated.
-* `openwhisk.counter.invoker_containerStart.warm_count` (counter) - Count of number of times a warm container is used.
+* `openwhisk.counter.invoker_containerStart.cold_counter` (counter) - Count of number of cold starts.
+* `openwhisk.counter.invoker_containerStart.recreated_counter` (counter) - Count of number of times container is recreated.
+* `openwhisk.counter.invoker_containerStart.warm_counter` (counter) - Count of number of times a warm container is used.
 
 ##### Log Collection
 
@@ -223,29 +245,29 @@ Following metrics capture stats around various docker command executions.
 
 Metrics below are emitted per kafka topic.
 
-* `openwhisk.histogram.kafka_<topic name>.delay_start` - Time delay between when a message was pushed to kafka and when it is read within a consumer. This metric is recorded for every message read.
-* `openwhisk.histogram.kafka_<topic name>_count` - Records the Queue size of the topic. By default this metric is emitted every 60 secs.
+* `openwhisk.histogram.kafka_<topic name>.delay_start` - Time delay between when a message was pushed to Kafka and when it is read within a consumer. This metric is recorded for every message read.
+* `openwhisk.gauge.kafka_<topic name>_counter` - Records the Queue size of the topic. By default this metric is emitted every 60 secs.
 
 Metrics per topic
 * `cacheInvalidation` - Emitted per controller while reading the cache invalidation messages.
   * `openwhisk.histogram.kafka_cacheInvalidation.delay_start`
-  * `openwhisk.histogram.kafka_cacheInvalidation_count.count`
+  * `openwhisk.histogram.kafka_cacheInvalidation_counter.count`
 * `health` - Emitted per controller while reading the invoker health pings.
   * `openwhisk.histogram.kafka_health.delay_start`
-  * `openwhisk.histogram.kafka_health_count`
+  * `openwhisk.histogram.kafka_health_counter`
 * `completed<controllerId>` - Topic to receive completed activations. This is emitted per controller for its own topic. For example for controller id 0 metric names would be
   * `openwhisk.histogram.kafka_completed0.delay_start`
-  * `openwhisk.histogram.kafka_completed0_count`
+  * `openwhisk.histogram.kafka_completed0_counter`
 * `invoker<invokerId>` - Topic to receive activations to complete. This is emitted per invoker for its own topic. For example for invoker id 0 metric names would be
-  * `openwhisk.histogram.kafka_invoker0_count`
+  * `openwhisk.histogram.kafka_invoker0_counter`
   * `openwhisk.histogram.kafka_invoker0.delay_start`
 
 #### Database Metrics
 
 ##### Cache Metrics
 
-* `openwhisk.counter.database_cacheHit_count` - Count of cache hits.
-* `openwhisk.counter.database_cacheMiss_count` - Count of cache misses.
+* `openwhisk.counter.database_cacheHit_counter` - Count of cache hits.
+* `openwhisk.counter.database_cacheMiss_counter` - Count of cache misses.
 
 Metrics below are emitted for database related operations and follow a pattern
 
@@ -272,7 +294,7 @@ If Kamon tags are enabled then metric name is `openwhisk.counter.cosmosdb_ru_use
 - `collection` - Name of collection. Example `activations`, `whisks` and `subjects`
 - `action` - Type of operation performed. Example `get`, `put`, `del`, `query` and `count`
 
-If Kamon tags are not enabled then metric name is of the form `openwhisk.counter.cosmosdb.ru.<collecton>.<action>`
+If Kamon tags are not enabled then metric name is of the form `openwhisk.counter.cosmosdb.ru.<collection>.<action>`
 
 ## User specific metrics
 ### Configuration
@@ -292,6 +314,8 @@ kind - action flavor, e.g. Node.js
 conductor - true for conductor backed actions
 memory - maximum memory allowed for action container
 causedBy - contains the "causedBy" annotation (can be "sequence" or nothing at the moment)
+size - size (in bytes) of the invocation response
+userDefinedStatusCode - status code represents `statusCode` set in result response. (if not set, this field will not be present)
 ```
 Metric is any user specific event produced by the system and it at this moment includes the following information:
 ```
@@ -302,10 +326,43 @@ ConcurrentInvocations - the number of in flight invocations per user.
 
 Example events that could be consumed from Kafka.
 Activation:
-```
-{"body":{"statusCode":0,"duration":3,"name":"whisk.system/invokerHealthTestAction0","waitTime":583915671,"conductor":false,"kind":"nodejs:6","initTime":0,"memory": 256, "causedBy": false},"eventType":"Activation","source":"invoker0","subject":"whisk.system","timestamp":1524476122676,"userId":"d0888ad5-5a92-435e-888a-d55a92935e54","namespace":"whisk.system"}
+```json
+{
+  "body": {
+    "statusCode": 0,
+    "duration": 3,
+    "name": "whisk.system/invokerHealthTestAction0",
+    "waitTime": 583915671,
+    "conductor": false,
+    "kind": "nodejs:6",
+    "initTime": 0,
+    "memory": 256,
+    "size": 463,
+    "causedBy": false
+  },
+  "eventType": "Activation",
+  "source": "invoker0",
+  "subject": "whisk.system",
+  "timestamp": 1524476122676,
+  "userId": "d0888ad5-5a92-435e-888a-d55a92935e54",
+  "namespace": "whisk.system"
+}
 ```
 Metric:
+```json
+{
+  "body": {
+    "metricName": "ConcurrentInvocations",
+    "metricValue": 1
+  },
+  "eventType": "Metric",
+  "source": "controller0",
+  "subject": "guest",
+  "timestamp": 1524476104419,
+  "userId": "23bc46b1-71f6-4ed5-8c54-816aa4f8c502",
+  "namespace": "guest"
+}
 ```
-{"body":{"metricName":"ConcurrentInvocations","metricValue":1},"eventType":"Metric","source":"controller0","subject":"guest","timestamp":1524476104419,"userId":"23bc46b1-71f6-4ed5-8c54-816aa4f8c502","namespace":"guest"}
-```
+
+### User-events consumer service
+All user metrics can be consumed and published to various services such as Prometheus, Datadog etc via Kamon by using the [user-events service](https://github.com/apache/openwhisk/tree/master/core/monitoring/user-events/README.md).

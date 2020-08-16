@@ -18,16 +18,11 @@
 plugins {
     id 'org.springframework.boot' version '2.0.2.RELEASE'
     id 'scala'
+    id 'maven'
+    id 'org.scoverage'
 }
-
-apply plugin: 'org.scoverage'
-apply plugin: 'maven'
 
 project.archivesBaseName = "openwhisk-admin-tools"
-
-repositories {
-    mavenCentral()
-}
 
 jar {
     enabled = true
@@ -47,7 +42,7 @@ bootJar {
 }
 
 dependencies {
+    compile "org.scala-lang:scala-library:${gradle.scala.version}"
     compile project(':common:scala')
-    compile 'org.rogach:scallop_2.12:3.1.2'
-    scoverage gradle.scoverage.deps
+    compile "org.rogach:scallop_${gradle.scala.depVersion}:3.3.2"
 }

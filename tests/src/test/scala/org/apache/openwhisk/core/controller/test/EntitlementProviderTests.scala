@@ -53,7 +53,7 @@ class EntitlementProviderTests extends ControllerTestCommon with ScalaFutures {
   val adminUser = WhiskAuthHelpers.newIdentity(Subject("admin"))
   val guestUser = WhiskAuthHelpers.newIdentity(Subject("anonym"))
 
-  val allowedKinds = Set("nodejs:6", "python")
+  val allowedKinds = Set("nodejs:10", "python")
   val disallowedKinds = Set("golang", "blackbox")
 
   def getExec(kind: String): Exec = {
@@ -166,7 +166,7 @@ class EntitlementProviderTests extends ControllerTestCommon with ScalaFutures {
         subject,
         Namespace(EntityName(subject.asString), uuid),
         BasicAuthenticationAuthKey(uuid, Secret()),
-        Set(Privilege.ACTIVATE))
+        rights = Set(Privilege.ACTIVATE))
     val collections = Seq(ACTIONS, RULES, TRIGGERS)
     val resources = collections map { Resource(someUser.namespace.name.toPath, _, Some("xyz")) }
     resources foreach { r =>

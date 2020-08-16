@@ -17,28 +17,31 @@
 
 package org.apache.openwhisk.core.database.cosmosdb
 
-import java.io.ByteArrayInputStream
-
 import _root_.rx.RxReactiveStreams
 import akka.actor.ActorSystem
+import akka.event.Logging.InfoLevel
 import akka.http.scaladsl.model.{ContentType, StatusCodes, Uri}
 import akka.stream.ActorMaterializer
-import akka.stream.scaladsl.{Sink, Source, StreamConverters}
-import akka.util.{ByteString, ByteStringBuilder}
+import akka.stream.scaladsl.{Sink, Source}
+import akka.util.ByteString
 import com.microsoft.azure.cosmosdb._
+import com.microsoft.azure.cosmosdb.internal.Constants.Properties
 import com.microsoft.azure.cosmosdb.rx.AsyncDocumentClient
-import spray.json.{DefaultJsonProtocol, JsObject, JsString, JsValue, RootJsonFormat, _}
-import org.apache.openwhisk.common.{LogMarkerToken, Logging, LoggingMarkers, MetricEmitter, TransactionId}
-import org.apache.openwhisk.core.database.StoreUtils.{checkDocHasRevision, deserialize, reportFailure}
+import kamon.metric.MeasurementUnit
+import org.apache.openwhisk.common.{LogMarkerToken, Logging, LoggingMarkers, MetricEmitter, Scheduler, TransactionId}
+import org.apache.openwhisk.core.database.StoreUtils._
 import org.apache.openwhisk.core.database._
 import org.apache.openwhisk.core.database.cosmosdb.CosmosDBArtifactStoreProvider.DocumentClientRef
 import org.apache.openwhisk.core.database.cosmosdb.CosmosDBConstants._
 import org.apache.openwhisk.core.entity.Attachments.Attached
 import org.apache.openwhisk.core.entity._
 import org.apache.openwhisk.http.Messages
+import spray.json._
 
 import scala.collection.JavaConverters._
 import scala.concurrent.{ExecutionContext, Future}
+import scala.concurrent.duration._
+import scala.util.Success
 
 class CosmosDBArtifactStore[DocumentAbstraction <: DocumentSerializer](protected val collName: String,
                                                                        protected val config: CosmosDBConfig,
@@ -64,21 +67,31 @@ class CosmosDBArtifactStore[DocumentAbstraction <: DocumentSerializer](protected
   protected val client: AsyncDocumentClient = clientRef.get.client
   private[cosmosdb] val (database, collection) = initialize()
 
-  private val _id = "_id"
-  private val _rev = "_rev"
-
   private val putToken = createToken("put", read = false)
   private val delToken = createToken("del", read = false)
   private val getToken = createToken("get")
   private val queryToken = createToken("query")
   private val countToken = createToken("count")
-  private val putAttachmentToken = createToken("putAttachment", read = false)
+  private val docSizeToken = createDocSizeToken()
+
+  private val documentsSizeToken = createUsageToken("documentsSize", MeasurementUnit.information.kilobytes)
+  private val indexSizeToken = createUsageToken("indexSize", MeasurementUnit.information.kilobytes)
+  private val documentCountToken = createUsageToken("documentCount")
+
+  private val softDeleteTTL = config.softDeleteTTL.map(_.toSeconds.toInt)
+
+  private val clusterIdValue = config.clusterId.map(JsString(_))
 
   logging.info(
     this,
     s"Initializing CosmosDBArtifactStore for collection [$collName]. Service endpoint [${client.getServiceEndpoint}], " +
       s"Read endpoint [${client.getReadEndpoint}], Write endpoint [${client.getWriteEndpoint}], Connection Policy [${client.getConnectionPolicy}], " +
-      s"Time to live [${collection.getDefaultTimeToLive} secs")
+      s"Time to live [${collection.getDefaultTimeToLive} secs, clusterId [${config.clusterId}], soft delete TTL [${config.softDeleteTTL}], " +
+      s"Consistency Level [${config.consistencyLevel}], Usage Metric Frequency [${config.recordUsageFrequency}]")
+
+  private val usageMetricRecorder = config.recordUsageFrequency.map { f =>
+    Scheduler.scheduleWaitAtLeast(f, 10.seconds)(() => recordResourceUsage())
+  }
 
   //Clone the returned instance as these are mutable
   def documentCollection(): DocumentCollection = new DocumentCollection(collection.toJson)
@@ -88,12 +101,12 @@ class CosmosDBArtifactStore[DocumentAbstraction <: DocumentSerializer](protected
   override protected[database] def put(d: DocumentAbstraction)(implicit transid: TransactionId): Future[DocInfo] = {
     val asJson = d.toDocumentRecord
 
-    val doc = toCosmosDoc(asJson)
+    val (doc, docSize) = toCosmosDoc(asJson)
     val id = doc.getId
     val docinfoStr = s"id: $id, rev: ${doc.getETag}"
     val start = transid.started(this, LoggingMarkers.DATABASE_SAVE, s"[PUT] '$collName' saving document: '$docinfoStr'")
 
-    val o = if (doc.getETag == null) {
+    val o = if (isNewDocument(doc)) {
       client.createDocument(collection.getSelfLink, doc, newRequestOption(id), true)
     } else {
       client.replaceDocument(doc, matchRevOption(id, doc.getETag))
@@ -101,9 +114,36 @@ class CosmosDBArtifactStore[DocumentAbstraction <: DocumentSerializer](protected
 
     val f = o
       .head()
+      .recoverWith {
+        case e: DocumentClientException if isConflict(e) && isNewDocument(doc) =>
+          val docId = DocId(asJson.fields(_id).convertTo[String])
+          //Fetch existing document and check if its deleted
+          getRaw(docId).flatMap {
+            case Some(js) =>
+              if (isSoftDeleted(js)) {
+                //Existing document is soft deleted. So can be replaced. Use the etag of document
+                //and replace it with document we are trying to add
+                val etag = js.fields(Properties.E_TAG).convertTo[String]
+                client.replaceDocument(doc, matchRevOption(id, etag)).head()
+              } else {
+                //Trying to create a new document and found an existing
+                //Document which is valid (not soft delete) then conflict is a valid outcome
+                throw e
+              }
+            case None =>
+              //Document not found. Should not happen unless someone else removed
+              //Propagate existing exception
+              throw e
+          }
+      }
       .transform(
         { r =>
-          transid.finished(this, start, s"[PUT] '$collName' completed document: '$docinfoStr'")
+          docSizeToken.histogram.record(docSize)
+          transid.finished(
+            this,
+            start,
+            s"[PUT] '$collName' completed document: '$docinfoStr', size=$docSize, ru=${r.getRequestCharge}${extraLogs(r)}",
+            InfoLevel)
           collectMetrics(putToken, r.getRequestCharge)
           toDocInfo(r.getResource)
         }, {
@@ -119,13 +159,14 @@ class CosmosDBArtifactStore[DocumentAbstraction <: DocumentSerializer](protected
   override protected[database] def del(doc: DocInfo)(implicit transid: TransactionId): Future[Boolean] = {
     checkDocHasRevision(doc)
     val start = transid.started(this, LoggingMarkers.DATABASE_DELETE, s"[DEL] '$collName' deleting document: '$doc'")
-    val f = client
-      .deleteDocument(selfLinkOf(doc.id), matchRevOption(doc))
-      .head()
+    val f = softDeleteTTL match {
+      case Some(_) => softDelete(doc)
+      case None    => hardDelete(doc)
+    }
+    val g = f
       .transform(
         { r =>
-          transid.finished(this, start, s"[DEL] '$collName' completed document: '$doc'")
-          collectMetrics(delToken, r.getRequestCharge)
+          transid.finished(this, start, s"[DEL] '$collName' completed document: '$doc'${extraLogs(r)}", InfoLevel)
           true
         }, {
           case e: DocumentClientException if isNotFound(e) =>
@@ -138,9 +179,33 @@ class CosmosDBArtifactStore[DocumentAbstraction <: DocumentSerializer](protected
         })
 
     reportFailure(
-      f,
+      g,
       start,
       failure => s"[DEL] '$collName' internal error, doc: '$doc', failure: '${failure.getMessage}'")
+  }
+
+  private def hardDelete(doc: DocInfo) = {
+    val f = client
+      .deleteDocument(selfLinkOf(doc.id), matchRevOption(doc))
+      .head()
+    f.foreach(r => collectMetrics(delToken, r.getRequestCharge))
+    f
+  }
+
+  private def softDelete(doc: DocInfo)(implicit transid: TransactionId) = {
+    for {
+      js <- getAsWhiskJson(doc.id)
+      r <- softDeletePut(doc, js)
+    } yield r
+  }
+
+  private def softDeletePut(docInfo: DocInfo, js: JsObject)(implicit transid: TransactionId) = {
+    val deletedJs = transform(js, Seq((deleted, Some(JsTrue))))
+    val (doc, _) = toCosmosDoc(deletedJs)
+    softDeleteTTL.foreach(doc.setTimeToLive(_))
+    val f = client.replaceDocument(doc, matchRevOption(docInfo)).head()
+    f.foreach(r => collectMetrics(putToken, r.getRequestCharge))
+    f
   }
 
   override protected[database] def get[A <: DocumentAbstraction](doc: DocInfo,
@@ -150,25 +215,37 @@ class CosmosDBArtifactStore[DocumentAbstraction <: DocumentSerializer](protected
     val start = transid.started(this, LoggingMarkers.DATABASE_GET, s"[GET] '$collName' finding document: '$doc'")
 
     require(doc != null, "doc undefined")
-    val f = client
-      .readDocument(selfLinkOf(doc.id), newRequestOption(doc.id))
-      .head()
-      .transform(
-        { rr =>
-          val js = getResultToWhiskJsonDoc(rr.getResource)
-          transid.finished(this, start, s"[GET] '$collName' completed: found document '$doc'")
-          collectMetrics(getToken, rr.getRequestCharge)
-          deserialize[A, DocumentAbstraction](doc, js)
-        }, {
-          case e: DocumentClientException if isNotFound(e) =>
-            transid.finished(this, start, s"[GET] '$collName', document: '$doc'; not found.")
-            // for compatibility
-            throw NoDocumentException("not found on 'get'")
-          case e => e
-        })
-      .recoverWith {
-        case _: DeserializationException => throw DocumentUnreadable(Messages.corruptedEntity)
-      }
+    val f =
+      client
+        .readDocument(selfLinkOf(doc.id), newRequestOption(doc.id))
+        .head()
+        .transform(
+          { rr =>
+            collectMetrics(getToken, rr.getRequestCharge)
+            if (isSoftDeleted(rr.getResource)) {
+              transid.finished(this, start, s"[GET] '$collName', document: '$doc'; not found.")
+              // for compatibility
+              throw NoDocumentException("not found on 'get'")
+            } else {
+              val (js, docSize) = getResultToWhiskJsonDoc(rr.getResource)
+              transid
+                .finished(
+                  this,
+                  start,
+                  s"[GET] '$collName' completed: found document '$doc',size=$docSize, ru=${rr.getRequestCharge}${extraLogs(rr)}",
+                  InfoLevel)
+              deserialize[A, DocumentAbstraction](doc, js)
+            }
+          }, {
+            case e: DocumentClientException if isNotFound(e) =>
+              transid.finished(this, start, s"[GET] '$collName', document: '$doc'; not found.")
+              // for compatibility
+              throw NoDocumentException("not found on 'get'")
+            case e => e
+          })
+        .recoverWith {
+          case _: DeserializationException => throw DocumentUnreadable(Messages.corruptedEntity)
+        }
 
     reportFailure(
       f,
@@ -184,19 +261,53 @@ class CosmosDBArtifactStore[DocumentAbstraction <: DocumentSerializer](protected
       .readDocument(selfLinkOf(id), newRequestOption(id))
       .head()
       .map { rr =>
-        val js = getResultToWhiskJsonDoc(rr.getResource)
-        transid.finished(this, start, s"[GET_BY_ID] '$collName' completed: found document '$id'")
         collectMetrics(getToken, rr.getRequestCharge)
-        Some(js)
+        if (isSoftDeleted(rr.getResource)) {
+          transid.finished(this, start, s"[GET_BY_ID] '$collName' completed: '$id' not found")
+          None
+        } else {
+          val (js, _) = getResultToWhiskJsonDoc(rr.getResource)
+          transid.finished(this, start, s"[GET_BY_ID] '$collName' completed: found document '$id'")
+          Some(js)
+        }
       }
       .recoverWith {
-        case e: DocumentClientException if isNotFound(e) => Future.successful(None)
+        case e: DocumentClientException if isNotFound(e) =>
+          transid.finished(this, start, s"[GET_BY_ID] '$collName' completed: '$id' not found")
+          Future.successful(None)
       }
 
     reportFailure(
       f,
       start,
       failure => s"[GET_BY_ID] '$collName' internal error, doc: '$id', failure: '${failure.getMessage}'")
+  }
+
+  /**
+   * Method exposed for test cases to access the raw json returned by CosmosDB
+   */
+  private[cosmosdb] def getRaw(id: DocId): Future[Option[JsObject]] = {
+    client
+      .readDocument(selfLinkOf(id), newRequestOption(id))
+      .head()
+      .map { rr =>
+        val js = rr.getResource.toJson.parseJson.asJsObject
+        Some(js)
+      }
+      .recoverWith {
+        case e: DocumentClientException if isNotFound(e) => Future.successful(None)
+      }
+  }
+
+  private def getAsWhiskJson(id: DocId): Future[JsObject] = {
+    client
+      .readDocument(selfLinkOf(id), newRequestOption(id))
+      .head()
+      .map { rr =>
+        val (js, _) = getResultToWhiskJsonDoc(rr.getResource)
+        collectMetrics(getToken, rr.getRequestCharge)
+        js
+      }
   }
 
   override protected[core] def query(table: String,
@@ -222,12 +333,24 @@ class CosmosDBArtifactStore[DocumentAbstraction <: DocumentSerializer](protected
 
     val querySpec = viewMapper.prepareQuery(ddoc, viewName, startKey, endKey, realLimit, realIncludeDocs, descending)
 
+    val options = newFeedOptions()
+    val queryMetrics = scala.collection.mutable.Buffer[QueryMetrics]()
+    if (transid.meta.extraLogging) {
+      options.setPopulateQueryMetrics(true)
+      options.setEmitVerboseTracesInQuery(true)
+    }
+
+    def collectQueryMetrics(r: FeedResponse[Document]): Unit = {
+      collectMetrics(queryToken, r.getRequestCharge)
+      queryMetrics.appendAll(r.getQueryMetrics.values().asScala)
+    }
+
     val publisher =
-      RxReactiveStreams.toPublisher(client.queryDocuments(collection.getSelfLink, querySpec, newFeedOptions()))
+      RxReactiveStreams.toPublisher(client.queryDocuments(collection.getSelfLink, querySpec, options))
     val f = Source
       .fromPublisher(publisher)
-      .wireTap(Sink.foreach(r => collectMetrics(queryToken, r.getRequestCharge)))
-      .mapConcat(asSeq)
+      .wireTap(collectQueryMetrics(_))
+      .mapConcat(asVector)
       .drop(skip)
       .map(queryResultToWhiskJsonDoc)
       .map(js =>
@@ -239,10 +362,23 @@ class CosmosDBArtifactStore[DocumentAbstraction <: DocumentSerializer](protected
       .map(_.toList)
       .map(l => if (limit > 0) l.take(limit) else l)
 
-    f.foreach { out =>
-      transid.finished(this, start, s"[QUERY] '$collName' completed: matched ${out.size}")
+    val g = f.andThen {
+      case Success(queryResult) =>
+        if (queryMetrics.nonEmpty) {
+          val combinedMetrics = QueryMetrics.ZERO.add(queryMetrics.toSeq: _*)
+          logging.debug(
+            this,
+            s"[QueryMetricsEnabled] Collection [$collName] - Query [${querySpec.getQueryText}].\nQueryMetrics\n[$combinedMetrics]")
+        }
+        val stats = viewMapper.recordQueryStats(ddoc, viewName, descending, querySpec.getParameters, queryResult)
+        val statsToLog = stats.map(s => " " + s).getOrElse("")
+        transid.finished(
+          this,
+          start,
+          s"[QUERY] '$collName' completed: matched ${queryResult.size}$statsToLog",
+          InfoLevel)
     }
-    reportFailure(f, start, failure => s"[QUERY] '$collName' internal error, failure: '${failure.getMessage}'")
+    reportFailure(g, start, failure => s"[QUERY] '$collName' internal error, failure: '${failure.getMessage}'")
   }
 
   override protected[core] def count(table: String,
@@ -261,7 +397,7 @@ class CosmosDBArtifactStore[DocumentAbstraction <: DocumentSerializer](protected
       .queryDocuments(collection.getSelfLink, querySpec, newFeedOptions())
       .head()
       .map { r =>
-        val count = r.getResults.asScala.head.getLong(aggregate).longValue()
+        val count = r.getResults.asScala.head.getLong(aggregate).longValue
         transid.finished(this, start, s"[COUNT] '$collName' completed: count $count")
         collectMetrics(countToken, r.getRequestCharge)
         if (count > skip) count - skip else 0L
@@ -276,95 +412,14 @@ class CosmosDBArtifactStore[DocumentAbstraction <: DocumentSerializer](protected
     contentType: ContentType,
     docStream: Source[ByteString, _],
     oldAttachment: Option[Attached])(implicit transid: TransactionId): Future[(DocInfo, Attached)] = {
-
-    val asJson = doc.toDocumentRecord
-    val id = asJson.fields("_id").convertTo[String].trim
-
     attachmentStore match {
       case Some(as) =>
         attachToExternalStore(doc, update, contentType, docStream, oldAttachment, as)
       case None =>
-        attachToCosmos(id, doc, update, contentType, docStream, oldAttachment)
+        Future.failed(new IllegalArgumentException(
+          s" '$cosmosScheme' is now not supported. You must configure an external AttachmentStore for storing attachments"))
     }
   }
-
-  private def attachToCosmos[A <: DocumentAbstraction](
-    id: String,
-    doc: A,
-    update: (A, Attached) => A,
-    contentType: ContentType,
-    docStream: Source[ByteString, _],
-    oldAttachment: Option[Attached])(implicit transid: TransactionId): Future[(DocInfo, Attached)] = {
-    //Convert Source to ByteString as Cosmos API works with InputStream only
-    for {
-      allBytes <- toByteString(docStream)
-      bytesOrSource <- inlineOrAttach(Source.single(allBytes))
-      uri = uriOf(bytesOrSource, UUID().asString)
-      attached <- {
-        val a = bytesOrSource match {
-          case Left(bytes) => Attached(uri.toString, contentType, Some(bytes.size), Some(digest(bytes)))
-          case Right(_)    => Attached(uri.toString, contentType, Some(allBytes.size), Some(digest(allBytes)))
-        }
-        Future.successful(a)
-      }
-      i1 <- put(update(doc, attached))
-      i2 <- bytesOrSource match {
-        case Left(_)  => Future.successful(i1)
-        case Right(s) => attach(i1, uri.path.toString, attached.attachmentType, allBytes)
-      }
-      //Remove old attachment if it was part of attachmentStore
-      _ <- oldAttachment
-        .map { old =>
-          val oldUri = Uri(old.attachmentName)
-          if (oldUri.scheme == cosmosScheme) {
-            val name = oldUri.path.toString
-            val docId = DocId(id)
-            client.deleteAttachment(s"${selfLinkOf(docId)}/attachments/$name", newRequestOption(docId)).head()
-          } else {
-            Future.successful(true)
-          }
-        }
-        .getOrElse(Future.successful(true))
-    } yield (i2, attached)
-  }
-
-  private def attach(doc: DocInfo, name: String, contentType: ContentType, allBytes: ByteString)(
-    implicit transid: TransactionId): Future[DocInfo] = {
-    val start = transid.started(
-      this,
-      LoggingMarkers.DATABASE_ATT_SAVE,
-      s"[ATT_PUT] '$collName' uploading attachment '$name' of document '$doc'")
-
-    checkDocHasRevision(doc)
-    val options = new MediaOptions
-    options.setContentType(contentType.toString())
-    options.setSlug(name)
-    val s = new ByteArrayInputStream(allBytes.toArray)
-    val f = client
-      .upsertAttachment(selfLinkOf(doc.id), s, options, matchRevOption(doc))
-      .head()
-      .transform(
-        { r =>
-          transid
-            .finished(this, start, s"[ATT_PUT] '$collName' completed uploading attachment '$name' of document '$doc'")
-          collectMetrics(putAttachmentToken, r.getRequestCharge)
-          doc //Adding attachment does not change the revision of document. So retain the doc info
-        }, {
-          case e: DocumentClientException if isConflict(e) =>
-            transid
-              .finished(this, start, s"[ATT_PUT] '$collName' uploading attachment '$name' of document '$doc'; conflict")
-            DocumentConflictException("conflict on 'attachment put'")
-          case e => e
-        })
-
-    reportFailure(
-      f,
-      start,
-      failure => s"[ATT_PUT] '$collName' internal error, name: '$name', doc: '$doc', failure: '${failure.getMessage}'")
-  }
-
-  private def toByteString(docStream: Source[ByteString, _]) =
-    docStream.runFold(new ByteStringBuilder)((builder, b) => builder ++= b).map(_.result().compact)
 
   override protected[core] def readAttachment[T](doc: DocInfo, attached: Attached, sink: Sink[ByteString, Future[T]])(
     implicit transid: TransactionId): Future[T] = {
@@ -376,48 +431,13 @@ class CosmosDBArtifactStore[DocumentAbstraction <: DocumentSerializer](protected
       case s if s == cosmosScheme || attachmentUri.isRelative =>
         //relative case is for compatibility with earlier naming approach where attachment name would be like 'jarfile'
         //Compared to current approach of '<scheme>:<name>'
-        readAttachmentFromCosmos(doc, attachmentUri, sink)
+        Future.failed(new IllegalArgumentException(
+          s" '$cosmosScheme' is now not supported. You must configure an external AttachmentStore for storing attachments"))
       case s if attachmentStore.isDefined && attachmentStore.get.scheme == s =>
         attachmentStore.get.readAttachment(doc.id, attachmentUri.path.toString, sink)
       case _ =>
         throw new IllegalArgumentException(s"Unknown attachment scheme in attachment uri $attachmentUri")
     }
-  }
-
-  private def readAttachmentFromCosmos[T](doc: DocInfo, attachmentUri: Uri, sink: Sink[ByteString, Future[T]])(
-    implicit transid: TransactionId): Future[T] = {
-    val name = attachmentUri.path
-    val start = transid.started(
-      this,
-      LoggingMarkers.DATABASE_ATT_GET,
-      s"[ATT_GET] '$collName' finding attachment '$name' of document '$doc'")
-    checkDocHasRevision(doc)
-
-    val f = client
-      .readAttachment(s"${selfLinkOf(doc.id)}/attachments/$name", matchRevOption(doc))
-      .head()
-      .flatMap(a => client.readMedia(a.getResource.getMediaLink).head())
-      .transform(
-        { r =>
-          //Here stream can only be fetched once
-          StreamConverters
-            .fromInputStream(() => r.getMedia)
-            .runWith(sink)
-        }, {
-          case e: DocumentClientException if isNotFound(e) =>
-            transid.finished(
-              this,
-              start,
-              s"[ATT_GET] '$collName', retrieving attachment '$name' of document '$doc'; not found.")
-            NoDocumentException("not found on 'delete'")
-          case e => e
-        })
-      .flatMap(identity)
-
-    reportFailure(
-      f,
-      start,
-      failure => s"[ATT_GET] '$collName' internal error, name: '$name', doc: '$doc', failure: '${failure.getMessage}'")
   }
 
   override protected[core] def deleteAttachments[T](doc: DocInfo)(implicit transid: TransactionId): Future[Boolean] =
@@ -426,8 +446,34 @@ class CosmosDBArtifactStore[DocumentAbstraction <: DocumentSerializer](protected
       .getOrElse(Future.successful(true)) // For CosmosDB it is expected that the entire document is deleted.
 
   override def shutdown(): Unit = {
+    //Its async so a chance exist for next scheduled job to still trigger
+    usageMetricRecorder.foreach(system.stop)
     attachmentStore.foreach(_.shutdown())
     clientRef.close()
+  }
+
+  def getResourceUsage(): Future[Option[CollectionResourceUsage]] = {
+    val opts = new RequestOptions
+    opts.setPopulateQuotaInfo(true)
+    client
+      .readCollection(collection.getSelfLink, opts)
+      .head()
+      .map(rr => CollectionResourceUsage(rr.getResponseHeaders.asScala.toMap))
+  }
+
+  private def recordResourceUsage() = {
+    getResourceUsage().map { o =>
+      o.foreach { u =>
+        u.documentsCount.foreach(documentCountToken.gauge.update(_))
+        u.documentsSize.foreach(ds => documentsSizeToken.gauge.update(ds.toKB))
+        u.indexSize.foreach(is => indexSizeToken.gauge.update(is.toKB))
+        logging.info(this, s"Collection usage stats for [$collName] are ${u.asString}")
+        u.indexingProgress.foreach { i =>
+          if (i < 100) logging.info(this, s"Indexing for collection [$collName] is at $i%")
+        }
+      }
+      o
+    }
   }
 
   private def isNotFound[A <: DocumentAbstraction](e: DocumentClientException) =
@@ -437,19 +483,22 @@ class CosmosDBArtifactStore[DocumentAbstraction <: DocumentSerializer](protected
     e.getStatusCode == StatusCodes.Conflict.intValue || e.getStatusCode == StatusCodes.PreconditionFailed.intValue
   }
 
-  private def toCosmosDoc(json: JsObject): Document = {
+  private def toCosmosDoc(json: JsObject): (Document, Int) = {
     val computedJs = documentHandler.computedFields(json)
     val computedOpt = if (computedJs.fields.nonEmpty) Some(computedJs) else None
     val fieldsToAdd =
       Seq(
         (cid, Some(JsString(escapeId(json.fields(_id).convertTo[String])))),
         (etag, json.fields.get(_rev)),
-        (computed, computedOpt))
+        (computed, computedOpt),
+        (clusterId, clusterIdValue))
     val fieldsToRemove = Seq(_id, _rev)
     val mapped = transform(json, fieldsToAdd, fieldsToRemove)
-    val doc = new Document(mapped.compactPrint)
+    val jsonString = mapped.compactPrint
+    val doc = new Document(jsonString)
     doc.set(selfLink, createSelfLink(doc.getId))
-    doc
+    doc.setTimeToLive(null) //Disable any TTL if in effect for earlier revision
+    (doc, jsonString.length)
   }
 
   private def queryResultToWhiskJsonDoc(doc: Document): JsObject = {
@@ -460,25 +509,12 @@ class CosmosDBArtifactStore[DocumentAbstraction <: DocumentSerializer](protected
     toWhiskJsonDoc(js, id, None)
   }
 
-  private def getResultToWhiskJsonDoc(doc: Document): JsObject = {
+  private def getResultToWhiskJsonDoc(doc: Document): (JsObject, Int) = {
     checkDoc(doc)
-    val js = doc.toJson.parseJson.asJsObject
-    toWhiskJsonDoc(js, doc.getId, Some(JsString(doc.getETag)))
-  }
-
-  private def toWhiskJsonDoc(js: JsObject, id: String, etag: Option[JsString]): JsObject = {
-    val fieldsToAdd = Seq((_id, Some(JsString(unescapeId(id)))), (_rev, etag))
-    transform(stripInternalFields(js), fieldsToAdd, Seq.empty)
-  }
-
-  private def transform(json: JsObject, fieldsToAdd: Seq[(String, Option[JsValue])], fieldsToRemove: Seq[String]) = {
-    val fields = json.fields ++ fieldsToAdd.flatMap(f => f._2.map((f._1, _))) -- fieldsToRemove
-    JsObject(fields)
-  }
-
-  private def stripInternalFields(js: JsObject) = {
-    //Strip out all field name starting with '_' which are considered as db specific internal fields
-    JsObject(js.fields.filter { case (k, _) => !k.startsWith("_") && k != cid })
+    val jsString = doc.toJson
+    val js = jsString.parseJson.asJsObject
+    val whiskDoc = toWhiskJsonDoc(js, doc.getId, Some(JsString(doc.getETag)))
+    (whiskDoc, jsString.length)
   }
 
   private def toDocInfo[T <: Resource](doc: T) = {
@@ -527,7 +563,33 @@ class CosmosDBArtifactStore[DocumentAbstraction <: DocumentSerializer](protected
   private def createToken(action: String, read: Boolean = true): LogMarkerToken = {
     val mode = if (read) "read" else "write"
     val tags = Map("action" -> action, "mode" -> mode, "collection" -> collName)
-    if (TransactionId.metricsKamonTags) LogMarkerToken("cosmosdb", "ru", "used", tags = tags)
-    else LogMarkerToken("cosmosdb", "ru", collName, Some(action))
+    if (TransactionId.metricsKamonTags) LogMarkerToken("cosmosdb", "ru", "used", tags = tags)(MeasurementUnit.none)
+    else LogMarkerToken("cosmosdb", "ru", collName, Some(action))(MeasurementUnit.none)
+  }
+
+  private def createUsageToken(name: String, unit: MeasurementUnit = MeasurementUnit.none): LogMarkerToken = {
+    val tags = Map("collection" -> collName)
+    if (TransactionId.metricsKamonTags) LogMarkerToken("cosmosdb", name, "used", tags = tags)(unit)
+    else LogMarkerToken("cosmosdb", name, collName)(unit)
+  }
+
+  private def createDocSizeToken(): LogMarkerToken = {
+    val unit = MeasurementUnit.information.bytes
+    val name = "doc"
+    val tags = Map("collection" -> collName)
+    if (TransactionId.metricsKamonTags) LogMarkerToken("cosmosdb", name, "size", tags = tags)(unit)
+    else LogMarkerToken("cosmosdb", name, collName)(unit)
+  }
+
+  private def isSoftDeleted(doc: Document) = doc.getBoolean(deleted) == true
+
+  private def isSoftDeleted(js: JsObject) = js.fields.get(deleted).contains(JsTrue)
+
+  private def isNewDocument(doc: Document) = doc.getETag == null
+
+  private def extraLogs(r: ResourceResponse[_])(implicit tid: TransactionId): String = {
+    if (tid.meta.extraLogging) {
+      " " + r.getRequestDiagnosticsString
+    } else ""
   }
 }

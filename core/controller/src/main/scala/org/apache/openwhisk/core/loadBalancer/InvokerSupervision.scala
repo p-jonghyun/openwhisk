@@ -34,7 +34,6 @@ import akka.util.Timeout
 import org.apache.openwhisk.common._
 import org.apache.openwhisk.core.connector._
 import org.apache.openwhisk.core.database.NoDocumentException
-import org.apache.openwhisk.core.entitlement.Privilege
 import org.apache.openwhisk.core.entity.ActivationId.ActivationIdGenerator
 import org.apache.openwhisk.core.entity._
 import org.apache.openwhisk.core.entity.types.EntityStore
@@ -263,11 +262,7 @@ object InvokerPool {
   val healthActionIdentity: Identity = {
     val whiskSystem = "whisk.system"
     val uuid = UUID()
-    Identity(
-      Subject(whiskSystem),
-      Namespace(EntityName(whiskSystem), uuid),
-      BasicAuthenticationAuthKey(uuid, Secret()),
-      Set[Privilege]())
+    Identity(Subject(whiskSystem), Namespace(EntityName(whiskSystem), uuid), BasicAuthenticationAuthKey(uuid, Secret()))
   }
 
   /** An action to use for monitoring invoker health. */
@@ -277,7 +272,7 @@ object InvokerPool {
         namespace = healthActionIdentity.namespace.name.toPath,
         name = EntityName(s"invokerHealthTestAction${i.asString}"),
         exec = CodeExecAsString(manifest, """function main(params) { return params; }""", None),
-        limits = ActionLimits(memory = MemoryLimit(MemoryLimit.minMemory)))
+        limits = ActionLimits(memory = MemoryLimit(MemoryLimit.MIN_MEMORY)))
     }
 }
 
@@ -420,7 +415,8 @@ class InvokerActor(invokerInstance: InvokerInstanceId, controllerInstance: Contr
         activationId = new ActivationIdGenerator {}.make(),
         rootControllerIndex = controllerInstance,
         blocking = false,
-        content = None)
+        content = None,
+        initArgs = Set.empty)
 
       context.parent ! ActivationRequest(activationMessage, invokerInstance)
     }

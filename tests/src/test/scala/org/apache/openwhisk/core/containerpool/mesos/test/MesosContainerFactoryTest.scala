@@ -17,6 +17,8 @@
 
 package org.apache.openwhisk.core.containerpool.mesos.test
 
+import java.util.concurrent.TimeUnit
+
 import akka.actor.ActorSystem
 import akka.stream.ActorMaterializer
 import akka.stream.scaladsl.Sink
@@ -39,10 +41,9 @@ import org.apache.mesos.v1.Protos.TaskID
 import org.apache.mesos.v1.Protos.TaskState
 import org.apache.mesos.v1.Protos.TaskStatus
 import org.junit.runner.RunWith
-import org.scalatest.BeforeAndAfterEach
-import org.scalatest.FlatSpecLike
-import org.scalatest.Matchers
+import org.scalatest.{BeforeAndAfterAll, BeforeAndAfterEach, FlatSpecLike, Matchers}
 import org.scalatest.junit.JUnitRunner
+
 import scala.collection.immutable.Map
 import scala.concurrent.Await
 import scala.concurrent.Future
@@ -58,6 +59,9 @@ import org.apache.openwhisk.core.entity.size._
 import org.apache.openwhisk.core.mesos.MesosConfig
 import org.apache.openwhisk.core.mesos.MesosContainerFactory
 import org.apache.openwhisk.core.mesos.MesosTimeoutConfig
+import org.apache.openwhisk.utils.retry
+
+import scala.collection.JavaConverters._
 
 @RunWith(classOf[JUnitRunner])
 class MesosContainerFactoryTest
@@ -65,7 +69,8 @@ class MesosContainerFactoryTest
     with FlatSpecLike
     with Matchers
     with StreamLogging
-    with BeforeAndAfterEach {
+    with BeforeAndAfterEach
+    with BeforeAndAfterAll {
 
   /** Awaits the given future, throws the exception enclosed in Failure. */
   def await[A](f: Future[A], timeout: FiniteDuration = 500.milliseconds) = Await.result[A](f, timeout)
@@ -81,7 +86,7 @@ class MesosContainerFactoryTest
   }
 
   // 80 slots, each 265MB
-  val poolConfig = ContainerPoolConfig(21200.MB, 0.5, false)
+  val poolConfig = ContainerPoolConfig(21200.MB, 0.5, false, FiniteDuration(1, TimeUnit.MINUTES))
   val actionMemory = 265.MB
   val mesosCpus = poolConfig.cpuShare(actionMemory) / 1024.0
 
@@ -91,10 +96,28 @@ class MesosContainerFactoryTest
       Seq("dns1", "dns2"),
       Seq.empty,
       Seq.empty,
+      Seq.empty,
       Map("extra1" -> Set("e1", "e2"), "extra2" -> Set("e3", "e4")))
 
+  private var factory: MesosContainerFactory = _
   override def beforeEach() = {
     stream.reset()
+  }
+
+  override protected def afterEach(): Unit = {
+    super.afterEach()
+    Option(factory).foreach(_.close())
+  }
+
+  override def afterAll(): Unit = {
+    TestKit.shutdownActorSystem(system, verifySystemShutdown = true)
+    retry({
+      val threadNames = Thread.getAllStackTraces.asScala.keySet.map(_.getName)
+      withClue(s"Threads related to  MesosActorSystem found to be active $threadNames") {
+        assert(!threadNames.exists(_.startsWith("MesosActorSystem")))
+      }
+    }, 10, Some(1.second))
+    super.afterAll()
   }
 
   val timeouts = MesosTimeoutConfig(1.seconds, 1.seconds, 1.seconds, 1.seconds, 1.seconds)
@@ -106,14 +129,14 @@ class MesosContainerFactoryTest
 
   it should "send Subscribe on init" in {
     val wskConfig = new WhiskConfig(Map.empty)
-    new MesosContainerFactory(
+    factory = new MesosContainerFactory(
       wskConfig,
       system,
       logging,
       Map("--arg1" -> Set("v1", "v2")),
       containerArgsConfig,
-      mesosConfig,
-      (system, mesosConfig) => testActor)
+      mesosConfig = mesosConfig,
+      clientFactory = (system, mesosConfig) => testActor)
 
     expectMsg(Subscribe)
   }
@@ -133,16 +156,15 @@ class MesosContainerFactoryTest
       2,
       timeouts)
 
-    val factory =
-      new MesosContainerFactory(
-        wskConfig,
-        system,
-        logging,
-        Map("--arg1" -> Set("v1", "v2"), "--arg2" -> Set("v3", "v4"), "other" -> Set("v5", "v6")),
-        containerArgsConfig,
-        mesosConfig,
-        (_, _) => testActor,
-        testTaskId _)
+    factory = new MesosContainerFactory(
+      wskConfig,
+      system,
+      logging,
+      Map("--arg1" -> Set("v1", "v2"), "--arg2" -> Set("v3", "v4"), "other" -> Set("v5", "v6")),
+      containerArgsConfig,
+      mesosConfig = mesosConfig,
+      clientFactory = (_, _) => testActor,
+      taskIdGenerator = testTaskId _)
 
     expectMsg(Subscribe)
     factory.createContainer(
@@ -177,16 +199,15 @@ class MesosContainerFactoryTest
 
   it should "send DeleteTask on destroy" in {
     val probe = TestProbe()
-    val factory =
-      new MesosContainerFactory(
-        wskConfig,
-        system,
-        logging,
-        Map("--arg1" -> Set("v1", "v2"), "--arg2" -> Set("v3", "v4"), "other" -> Set("v5", "v6")),
-        containerArgsConfig,
-        mesosConfig,
-        (system, mesosConfig) => probe.testActor,
-        testTaskId _)
+    factory = new MesosContainerFactory(
+      wskConfig,
+      system,
+      logging,
+      Map("--arg1" -> Set("v1", "v2"), "--arg2" -> Set("v3", "v4"), "other" -> Set("v5", "v6")),
+      containerArgsConfig,
+      mesosConfig = mesosConfig,
+      clientFactory = (system, mesosConfig) => probe.testActor,
+      taskIdGenerator = testTaskId _)
 
     probe.expectMsg(Subscribe)
     //emulate successful subscribe
@@ -246,21 +267,21 @@ class MesosContainerFactoryTest
 
   it should "return static message for logs" in {
     val probe = TestProbe()
-    val factory =
-      new MesosContainerFactory(
-        wskConfig,
-        system,
-        logging,
-        Map("--arg1" -> Set("v1", "v2"), "--arg2" -> Set("v3", "v4"), "other" -> Set("v5", "v6")),
-        new ContainerArgsConfig(
-          "bridge",
-          Seq.empty,
-          Seq.empty,
-          Seq.empty,
-          Map("extra1" -> Set("e1", "e2"), "extra2" -> Set("e3", "e4"))),
-        mesosConfig,
-        (system, mesosConfig) => probe.testActor,
-        testTaskId _)
+    factory = new MesosContainerFactory(
+      wskConfig,
+      system,
+      logging,
+      Map("--arg1" -> Set("v1", "v2"), "--arg2" -> Set("v3", "v4"), "other" -> Set("v5", "v6")),
+      new ContainerArgsConfig(
+        "bridge",
+        Seq.empty,
+        Seq.empty,
+        Seq.empty,
+        Seq.empty,
+        Map("extra1" -> Set("e1", "e2"), "extra2" -> Set("e3", "e4"))),
+      mesosConfig = mesosConfig,
+      clientFactory = (system, mesosConfig) => probe.testActor,
+      taskIdGenerator = testTaskId _)
 
     probe.expectMsg(Subscribe)
     //emulate successful subscribe

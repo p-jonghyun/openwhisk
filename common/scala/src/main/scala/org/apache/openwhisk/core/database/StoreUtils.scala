@@ -23,8 +23,9 @@ import akka.event.Logging.ErrorLevel
 import akka.stream.SinkShape
 import akka.stream.scaladsl.{Broadcast, Flow, GraphDSL, Keep, Sink}
 import akka.util.ByteString
+import com.google.common.base.Throwables
 import spray.json.DefaultJsonProtocol._
-import spray.json.{JsObject, RootJsonFormat}
+import spray.json.{JsObject, JsValue, RootJsonFormat}
 import org.apache.openwhisk.common.{Logging, StartMarker, TransactionId}
 import org.apache.openwhisk.core.entity.{DocInfo, DocRevision, DocumentReader, WhiskDocument}
 
@@ -41,7 +42,11 @@ private[database] object StoreUtils {
     f.failed.foreach {
       case _: ArtifactStoreException => // These failures are intentional and shouldn't trigger the catcher.
       case x =>
-        transid.failed(this, start, s"${failureMessage(x)} [${x.getClass.getSimpleName}]", ErrorLevel)
+        transid.failed(
+          this,
+          start,
+          s"${failureMessage(x)} [${x.getClass.getSimpleName}]\n" + Throwables.getStackTraceAsString(x),
+          ErrorLevel)
     }
     f
   }
@@ -95,6 +100,21 @@ private[database] object StoreUtils {
   def encodeDigest(bytes: Array[Byte]): String = {
     val digest = bytes.map("%02x".format(_)).mkString
     s"$encodedAlgoName-$digest"
+  }
+
+  /**
+   * Transforms a json object by adding and removing fields
+   *
+   * @param json base json object to transform
+   * @param fieldsToAdd list of fields to add. If the value provided is `None` then it would be ignored
+   * @param fieldsToRemove list of field names to remove
+   * @return transformed json
+   */
+  def transform(json: JsObject,
+                fieldsToAdd: Seq[(String, Option[JsValue])],
+                fieldsToRemove: Seq[String] = Seq.empty): JsObject = {
+    val fields = json.fields ++ fieldsToAdd.flatMap(f => f._2.map((f._1, _))) -- fieldsToRemove
+    JsObject(fields)
   }
 
   private def combineResult[T](digest: Future[String], length: Future[Long], upload: Future[T])(

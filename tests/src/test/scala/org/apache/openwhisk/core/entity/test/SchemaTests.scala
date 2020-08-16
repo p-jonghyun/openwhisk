@@ -42,8 +42,6 @@ import org.apache.openwhisk.utils.JsHelpers
 @RunWith(classOf[JUnitRunner])
 class SchemaTests extends FlatSpec with BeforeAndAfter with ExecHelpers with Matchers {
 
-  behavior of "AuthKey"
-
   behavior of "Privilege"
 
   private implicit class ExecJson(e: Exec) {
@@ -106,12 +104,12 @@ class SchemaTests extends FlatSpec with BeforeAndAfter with ExecHelpers with Mat
     Identity.serdes.write(i) shouldBe expected
   }
 
-  it should "serdes read an generic identity" in {
+  it should "serdes read a generic identity" in {
     val uuid = UUID()
     val subject = Subject("test_subject")
     val entity = EntityName("test_subject")
     val genericAuthKey = new GenericAuthKey(JsObject("test_key" -> "test_value".toJson))
-    val i = WhiskAuthHelpers.newIdentity(subject, uuid, genericAuthKey)
+    val i = WhiskAuthHelpers.newIdentityGenricAuth(subject, uuid, genericAuthKey)
 
     val json = JsObject(
       "subject" -> Subject("test_subject").toJson,
@@ -120,6 +118,22 @@ class SchemaTests extends FlatSpec with BeforeAndAfter with ExecHelpers with Mat
       "rights" -> Array("READ", "PUT", "DELETE", "ACTIVATE").toJson,
       "limits" -> JsObject.empty)
     Identity.serdes.read(json) shouldBe i
+  }
+
+  it should "deserialize view result" in {
+    implicit val tid = TransactionId("test")
+    val subject = Subject("test_subject")
+    val id = WhiskAuthHelpers.newIdentity(subject)
+
+    val json = JsObject(
+      "id" -> subject.asString.toJson,
+      "value" -> JsObject(
+        "uuid" -> id.authkey.asInstanceOf[BasicAuthenticationAuthKey].uuid.toJson,
+        "key" -> id.authkey.asInstanceOf[BasicAuthenticationAuthKey].key.toJson,
+        "namespace" -> "test_subject".toJson),
+      "doc" -> JsNull)
+
+    Identity.rowToIdentity(json, "test") shouldBe id
   }
 
   behavior of "DocInfo"
@@ -138,7 +152,7 @@ class SchemaTests extends FlatSpec with BeforeAndAfter with ExecHelpers with Mat
     }
 
     DocRevision.serdes.read(JsNull) shouldBe DocRevision.empty
-    DocRevision.serdes.read(JsString("")) shouldBe DocRevision("")
+    DocRevision.serdes.read(JsString.empty) shouldBe DocRevision("")
     DocRevision.serdes.read(JsString("a")) shouldBe DocRevision("a")
     DocRevision.serdes.read(JsString(" a")) shouldBe DocRevision("a")
     DocRevision.serdes.read(JsString("a ")) shouldBe DocRevision("a")
@@ -367,7 +381,7 @@ class SchemaTests extends FlatSpec with BeforeAndAfter with ExecHelpers with Mat
 
     FullyQualifiedEntityName.resolveName(JsString("/a/b/c/d"), EntityName("ns")) shouldBe None
 
-    FullyQualifiedEntityName.resolveName(JsString(""), EntityName("ns")) shouldBe None
+    FullyQualifiedEntityName.resolveName(JsString.empty, EntityName("ns")) shouldBe None
   }
 
   behavior of "Binding"
@@ -416,8 +430,9 @@ class SchemaTests extends FlatSpec with BeforeAndAfter with ExecHelpers with Mat
       "binding" -> JsObject.empty,
       "parameters" -> Parameters().toJson,
       "version" -> SemVer().toJson,
-      "publish" -> JsBoolean(false),
-      "annotations" -> Parameters().toJson)
+      "publish" -> JsFalse,
+      "annotations" -> Parameters().toJson,
+      "updated" -> pkg.updated.toEpochMilli.toJson)
   }
 
   it should "serialize and deserialize package binding" in {
@@ -428,8 +443,9 @@ class SchemaTests extends FlatSpec with BeforeAndAfter with ExecHelpers with Mat
       "binding" -> JsObject("namespace" -> "x".toJson, "name" -> "y".toJson),
       "parameters" -> Parameters().toJson,
       "version" -> SemVer().toJson,
-      "publish" -> JsBoolean(false),
-      "annotations" -> Parameters().toJson)
+      "publish" -> JsFalse,
+      "annotations" -> Parameters().toJson,
+      "updated" -> pkg.updated.toEpochMilli.toJson)
     //val legacyPkgAsJson = JsObject(pkgAsJson.fields + ("binding" -> JsObject("namespace" -> "x".toJson, "name" -> "y".toJson)))
     WhiskPackage.serdes.write(pkg) shouldBe pkgAsJson
     WhiskPackage.serdes.read(pkgAsJson) shouldBe pkg
@@ -477,7 +493,7 @@ class SchemaTests extends FlatSpec with BeforeAndAfter with ExecHelpers with Mat
   it should "initialize exec manifest" in {
     val runtimes = ExecManifest.runtimesManifest
     val kind = runtimes.resolveDefaultRuntime("nodejs:default").get.kind
-    Some(kind) should contain oneOf ("nodejs:6", "nodejs:8", "nodejs:10")
+    Some(kind) should contain oneOf ("nodejs:10", "nodejs:12")
   }
 
   it should "properly deserialize and reserialize JSON" in {
@@ -545,14 +561,50 @@ class SchemaTests extends FlatSpec with BeforeAndAfter with ExecHelpers with Mat
   }
 
   it should "exclude undefined code in whisk action initializer" in {
-    ExecutableWhiskAction(EntityPath("a"), EntityName("b"), bb("container1")).containerInitializer shouldBe {
+    ExecutableWhiskAction(EntityPath("a"), EntityName("b"), bb("container1")).containerInitializer() shouldBe {
       JsObject("name" -> "b".toJson, "binary" -> false.toJson, "main" -> "main".toJson)
     }
-    ExecutableWhiskAction(EntityPath("a"), EntityName("b"), bb("container1", "xyz")).containerInitializer shouldBe {
+    ExecutableWhiskAction(EntityPath("a"), EntityName("b"), bb("container1", "xyz")).containerInitializer() shouldBe {
       JsObject("name" -> "b".toJson, "binary" -> false.toJson, "main" -> "main".toJson, "code" -> "xyz".toJson)
     }
-    ExecutableWhiskAction(EntityPath("a"), EntityName("b"), bb("container1", "", Some("naim"))).containerInitializer shouldBe {
+    ExecutableWhiskAction(EntityPath("a"), EntityName("b"), bb("container1", "", Some("naim")))
+      .containerInitializer() shouldBe {
       JsObject("name" -> "b".toJson, "binary" -> false.toJson, "main" -> "naim".toJson)
+    }
+  }
+
+  it should "allow of main override in action initializer" in {
+    ExecutableWhiskAction(EntityPath("a"), EntityName("b"), jsDefault("")).containerInitializer() shouldBe {
+      JsObject("name" -> "b".toJson, "binary" -> false.toJson, "code" -> JsString.empty, "main" -> "main".toJson)
+    }
+
+    ExecutableWhiskAction(EntityPath("a"), EntityName("b"), jsDefault("", Some("bar")))
+      .containerInitializer() shouldBe {
+      JsObject("name" -> "b".toJson, "binary" -> false.toJson, "code" -> JsString.empty, "main" -> "bar".toJson)
+    }
+  }
+
+  it should "include optional environment variables" in {
+    val env = Map(
+      "A" -> "c".toJson,
+      "B" -> JsNull,
+      "C" -> JsTrue,
+      "D" -> JsNumber(3),
+      "E" -> JsArray(JsString("a")),
+      "F" -> JsObject("a" -> JsFalse))
+
+    ExecutableWhiskAction(EntityPath("a"), EntityName("b"), bb("container1")).containerInitializer(env) shouldBe {
+      JsObject(
+        "name" -> "b".toJson,
+        "binary" -> false.toJson,
+        "main" -> "main".toJson,
+        "env" -> JsObject(
+          "A" -> JsString("c"),
+          "B" -> JsString(""),
+          "C" -> JsString("true"),
+          "D" -> JsString("3"),
+          "E" -> JsString("[\"a\"]"),
+          "F" -> JsString("{\"a\":false}")))
     }
   }
 
@@ -608,7 +660,7 @@ class SchemaTests extends FlatSpec with BeforeAndAfter with ExecHelpers with Mat
   it should "reject null code/image arguments" in {
     an[IllegalArgumentException] should be thrownBy Exec.serdes.read(null)
     a[DeserializationException] should be thrownBy Exec.serdes.read("{}" parseJson)
-    a[DeserializationException] should be thrownBy Exec.serdes.read(JsString(""))
+    a[DeserializationException] should be thrownBy Exec.serdes.read(JsString.empty)
   }
 
   it should "serialize to json" in {
@@ -620,7 +672,8 @@ class SchemaTests extends FlatSpec with BeforeAndAfter with ExecHelpers with Mat
   }
 
   behavior of "Parameter"
-  it should "properly deserialize and reserialize JSON" in {
+
+  it should "properly deserialize and reserialize JSON without optional field" in {
     val json = Seq[JsValue](
       JsArray(JsObject("key" -> "k".toJson, "value" -> "v".toJson)),
       JsArray(JsObject("key" -> "k".toJson, "value" -> "v".toJson, "foo" -> "bar".toJson)),
@@ -636,6 +689,31 @@ class SchemaTests extends FlatSpec with BeforeAndAfter with ExecHelpers with Mat
     assert(params(1).toString != json(1).compactPrint) // drops unknown prop "foo"
     assert(params(2).toString == json(2).compactPrint) // drops unknown prop "foo"
     assert(params(3).toString == json(3).compactPrint) // drops unknown prop "foo"
+  }
+
+  it should "properly deserialize and reserialize parameters with optional field" in {
+    val json = Seq[JsValue](
+      JsArray(JsObject("key" -> "k".toJson, "value" -> "v".toJson)),
+      JsArray(JsObject("key" -> "k".toJson, "value" -> "v".toJson, "init" -> JsFalse)),
+      JsArray(JsObject("key" -> "k".toJson, "value" -> "v".toJson, "init" -> JsTrue)))
+
+    val params = json.map { p =>
+      Parameters.serdes.read(p)
+    }
+    assert(params(0) == Parameters("k", "v"))
+    assert(params(1) == Parameters("k", "v", false))
+    assert(params(2) == Parameters("k", "v", true))
+    assert(params(0).toString == json(0).compactPrint)
+    assert(params(1).toString == json(0).compactPrint) // init == false drops the property from the JSON
+    assert(params(2).toString == json(2).compactPrint)
+  }
+
+  it should "reject parameters with invalid optional field" in {
+    val json = Seq[JsValue](JsArray(JsObject("key" -> "k".toJson, "value" -> "v".toJson, "init" -> JsString("true"))))
+
+    json.foreach { p =>
+      an[DeserializationException] should be thrownBy Parameters.serdes.read(p)
+    }
   }
 
   it should "filter immutable parameters" in {
@@ -668,7 +746,19 @@ class SchemaTests extends FlatSpec with BeforeAndAfter with ExecHelpers with Mat
     an[IllegalArgumentException] should be thrownBy Parameters(null, "")
     an[IllegalArgumentException] should be thrownBy Parameters(null, " ")
     an[IllegalArgumentException] should be thrownBy Parameters(null)
+  }
 
+  it should "recognize truthy values" in {
+    Seq(JsTrue, JsNumber(1), JsString("x")).foreach { v =>
+      Parameters("x", v).isTruthy("x") shouldBe true
+    }
+
+    Seq(JsFalse, JsNumber(0), JsString.empty, JsNull).foreach { v =>
+      Parameters("x", v).isTruthy("x") shouldBe false
+    }
+
+    Parameters("x", JsTrue).isTruthy("y") shouldBe false
+    Parameters("x", JsTrue).isTruthy("y", valueForNonExistent = true) shouldBe true
   }
 
   it should "serialize to json" in {
@@ -685,18 +775,18 @@ class SchemaTests extends FlatSpec with BeforeAndAfter with ExecHelpers with Mat
     val json = Seq[JsValue](
       JsObject(
         "timeout" -> TimeLimit.STD_DURATION.toMillis.toInt.toJson,
-        "memory" -> MemoryLimit.stdMemory.toMB.toInt.toJson,
-        "logs" -> LogLimit.stdLogSize.toMB.toInt.toJson,
-        "concurrency" -> ConcurrencyLimit.stdConcurrent.toInt.toJson),
+        "memory" -> MemoryLimit.STD_MEMORY.toMB.toInt.toJson,
+        "logs" -> LogLimit.STD_LOGSIZE.toMB.toInt.toJson,
+        "concurrency" -> ConcurrencyLimit.STD_CONCURRENT.toInt.toJson),
       JsObject(
         "timeout" -> TimeLimit.STD_DURATION.toMillis.toInt.toJson,
-        "memory" -> MemoryLimit.stdMemory.toMB.toInt.toJson,
-        "logs" -> LogLimit.stdLogSize.toMB.toInt.toJson,
-        "concurrency" -> ConcurrencyLimit.stdConcurrent.toInt.toJson,
+        "memory" -> MemoryLimit.STD_MEMORY.toMB.toInt.toJson,
+        "logs" -> LogLimit.STD_LOGSIZE.toMB.toInt.toJson,
+        "concurrency" -> ConcurrencyLimit.STD_CONCURRENT.toInt.toJson,
         "foo" -> "bar".toJson),
       JsObject(
         "timeout" -> TimeLimit.STD_DURATION.toMillis.toInt.toJson,
-        "memory" -> MemoryLimit.stdMemory.toMB.toInt.toJson))
+        "memory" -> MemoryLimit.STD_MEMORY.toMB.toInt.toJson))
     val limits = json.map(ActionLimits.serdes.read)
     assert(limits(0) == ActionLimits())
     assert(limits(1) == ActionLimits())
@@ -712,19 +802,19 @@ class SchemaTests extends FlatSpec with BeforeAndAfter with ExecHelpers with Mat
       JsObject.empty,
       JsNull,
       JsObject("timeout" -> TimeLimit.STD_DURATION.toMillis.toInt.toJson),
-      JsObject("memory" -> MemoryLimit.stdMemory.toMB.toInt.toJson),
-      JsObject("logs" -> (LogLimit.stdLogSize.toMB.toInt + 1).toJson),
+      JsObject("memory" -> MemoryLimit.STD_MEMORY.toMB.toInt.toJson),
+      JsObject("logs" -> (LogLimit.STD_LOGSIZE.toMB.toInt + 1).toJson),
       JsObject(
         "TIMEOUT" -> TimeLimit.STD_DURATION.toMillis.toInt.toJson,
-        "MEMORY" -> MemoryLimit.stdMemory.toMB.toInt.toJson),
+        "MEMORY" -> MemoryLimit.STD_MEMORY.toMB.toInt.toJson),
       JsObject(
         "timeout" -> (TimeLimit.STD_DURATION.toMillis.toDouble + .01).toJson,
-        "memory" -> (MemoryLimit.stdMemory.toMB.toDouble + .01).toJson),
+        "memory" -> (MemoryLimit.STD_MEMORY.toMB.toDouble + .01).toJson),
       JsObject("timeout" -> null, "memory" -> null),
       JsObject("timeout" -> JsNull, "memory" -> JsNull),
       JsObject(
         "timeout" -> TimeLimit.STD_DURATION.toMillis.toString.toJson,
-        "memory" -> MemoryLimit.stdMemory.toMB.toInt.toString.toJson))
+        "memory" -> MemoryLimit.STD_MEMORY.toMB.toInt.toString.toJson))
 
     limits.foreach { p =>
       a[DeserializationException] should be thrownBy ActionLimits.serdes.read(p)
@@ -760,17 +850,17 @@ class SchemaTests extends FlatSpec with BeforeAndAfter with ExecHelpers with Mat
       LogLimit())
     an[IllegalArgumentException] should be thrownBy ActionLimits(
       TimeLimit(),
-      MemoryLimit(MemoryLimit.minMemory - 1.B),
+      MemoryLimit(MemoryLimit.MIN_MEMORY - 1.B),
       LogLimit())
     an[IllegalArgumentException] should be thrownBy ActionLimits(
       TimeLimit(),
       MemoryLimit(),
-      LogLimit(LogLimit.minLogSize - 1.B))
+      LogLimit(LogLimit.MIN_LOGSIZE - 1.B))
     an[IllegalArgumentException] should be thrownBy ActionLimits(
       TimeLimit(),
       MemoryLimit(),
       LogLimit(),
-      ConcurrencyLimit(ConcurrencyLimit.minConcurrent - 1))
+      ConcurrencyLimit(ConcurrencyLimit.MIN_CONCURRENT - 1))
 
     an[IllegalArgumentException] should be thrownBy ActionLimits(
       TimeLimit(TimeLimit.MAX_DURATION + 1.millisecond),
@@ -778,17 +868,17 @@ class SchemaTests extends FlatSpec with BeforeAndAfter with ExecHelpers with Mat
       LogLimit())
     an[IllegalArgumentException] should be thrownBy ActionLimits(
       TimeLimit(),
-      MemoryLimit(MemoryLimit.maxMemory + 1.B),
+      MemoryLimit(MemoryLimit.MAX_MEMORY + 1.B),
       LogLimit())
     an[IllegalArgumentException] should be thrownBy ActionLimits(
       TimeLimit(),
       MemoryLimit(),
-      LogLimit(LogLimit.maxLogSize + 1.B))
+      LogLimit(LogLimit.MAX_LOGSIZE + 1.B))
     an[IllegalArgumentException] should be thrownBy ActionLimits(
       TimeLimit(),
       MemoryLimit(),
       LogLimit(),
-      ConcurrencyLimit(ConcurrencyLimit.maxConcurrent + 1))
+      ConcurrencyLimit(ConcurrencyLimit.MAX_CONCURRENT + 1))
   }
 
   it should "parse activation id as uuid" in {

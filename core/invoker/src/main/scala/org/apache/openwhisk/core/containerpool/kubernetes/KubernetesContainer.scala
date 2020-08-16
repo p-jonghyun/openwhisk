@@ -25,6 +25,7 @@ import akka.stream.StreamLimitReachedException
 import akka.stream.scaladsl.Framing.FramingException
 import akka.stream.scaladsl.Source
 import akka.util.ByteString
+import io.fabric8.kubernetes.client.PortForward
 
 import scala.concurrent.ExecutionContext
 import scala.concurrent.Future
@@ -36,6 +37,8 @@ import org.apache.openwhisk.core.containerpool.docker.{CompleteAfterOccurrences,
 import org.apache.openwhisk.core.entity.ByteSize
 import org.apache.openwhisk.core.entity.size._
 import org.apache.openwhisk.http.Messages
+
+import scala.util.Failure
 
 object KubernetesContainer {
 
@@ -67,7 +70,19 @@ object KubernetesContainer {
 
     for {
       container <- kubernetes.run(podName, image, memory, environment, labels).recoverWith {
-        case _ => Future.failed(WhiskContainerStartupError(s"Failed to run container with image '${image}'."))
+        case _: KubernetesPodApiException =>
+          //apiserver call failed - this will expose a different error to users
+          Future.failed(WhiskContainerStartupError(Messages.resourceProvisionError))
+        case _ =>
+          kubernetes
+            .rm(podName)
+            .andThen {
+              case Failure(e) =>
+                log.error(this, s"Failed delete pod for '$name': ${e.getClass} - ${e.getMessage}")
+            }
+            .transformWith { _ =>
+              Future.failed(WhiskContainerStartupError(s"Failed to run container with image '${image}'."))
+            }
       }
     } yield container
   }
@@ -89,10 +104,11 @@ object KubernetesContainer {
 class KubernetesContainer(protected[core] val id: ContainerId,
                           protected[core] val addr: ContainerAddress,
                           protected[core] val workerIP: String,
-                          protected[core] val nativeContainerId: String)(implicit kubernetes: KubernetesApi,
-                                                                         override protected val as: ActorSystem,
-                                                                         protected val ec: ExecutionContext,
-                                                                         protected val logging: Logging)
+                          protected[core] val nativeContainerId: String,
+                          portForward: Option[PortForward] = None)(implicit kubernetes: KubernetesApi,
+                                                                   override protected val as: ActorSystem,
+                                                                   protected val ec: ExecutionContext,
+                                                                   protected val logging: Logging)
     extends Container {
 
   /** The last read timestamp in the log file */
@@ -109,6 +125,7 @@ class KubernetesContainer(protected[core] val id: ContainerId,
 
   override def destroy()(implicit transid: TransactionId): Future[Unit] = {
     super.destroy()
+    portForward.foreach(_.close())
     kubernetes.rm(this)
   }
 

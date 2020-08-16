@@ -27,7 +27,7 @@ observable output.
 An action may be created from a function programmed using a number of [supported languages and runtimes](#languages-and-runtimes),
 or from a binary-compatible executable, or even executables packaged as Docker containers.
 
-* The OpenWhisk CLI [`wsk`](https://github.com/apache/incubator-openwhisk-cli/releases)
+* The OpenWhisk CLI [`wsk`](https://github.com/apache/openwhisk-cli/releases)
 makes it easy to create and invoke actions. Instructions for configuring the CLI are available [here](cli.md).
 * You can also use the [REST API](rest_api.md).
 
@@ -61,6 +61,7 @@ paths more suitable. Or, you can [create a new runtime](actions-new.md).
 * [PHP](actions-php.md)
 * [Python](actions-python.md)
 * [Ruby](actions-ruby.md)
+* [Rust](actions-rust.md)
 * [Swift](actions-swift.md)
 * [.NET Core](actions-dotnet.md)
 * [Docker and native binaries](actions-docker.md)
@@ -70,6 +71,16 @@ pipeline called a [sequence](#creating-action-sequences). The polyglot nature of
 powerful in that it affords you the ability to use the right language for the problem you're solving,
 and separates the orchestration of the dataflow between functions from the choice of language.
 A more advanced form of composition is described [here](conductors.md).
+
+If your runtime is not listed there, you can create a new one for your specific language.
+
+You can create a new runtime in two ways:
+
+- Implementing the [runtime specification](actions-new.md)
+- Using the [ActionLoop engine](actions-actionloop.md) that provides a simplified path for building a new runtime.
+
+Follow the instructions in [Updating Action Language Runtimes](actions-update.md) for updating, removing or renaming
+runtime kinds or language families.
 
 ## The basics
 
@@ -117,7 +128,7 @@ accepts optional parameters and returns a standard greeting.
  * @return a JSON object containing the message in a field called "msg".
  */
 function main(params) {
-  // log the paramaters to stdout
+  // log the parameters to stdout
   console.log('params:', params);
 
   // if a value for name is provided, use it else use a default
@@ -227,8 +238,55 @@ so that one may check for the result later, as with non-blocking requests
 When an action exceeds its configured time limit, the activation record will indicate this error.
 See [understanding the activation record](#understanding-the-activation-record) for more details.
 
+### Working with activations
 
-### Understanding the activation record
+Some common CLI commands for working with activations are:
+- `wsk activation list`: lists all activations
+- `wsk activation get --last`: retrieves the most recent activation record
+- `wsk activation result <activationId>`: retrieves only the result of the activation (or use `--last` to get the most recent result).
+- `wsk activation logs <activationId>`: retrieves only the logs of the activation.
+- `wsk activation logs <activationId> --strip`: strips metadata from each log line so the logs are easier to read.
+
+#### The `wsk activation list` command
+
+The `activation list` command lists all activations, or activations filtered by namespace or name. The result set can be limited by using several flags:
+
+```
+Flags:
+  -f, --full          include full activation description
+  -l, --limit LIMIT   only return LIMIT number of activations from the collection with a maximum LIMIT of 200 activations (default 30)
+      --since SINCE   return activations with timestamps later than SINCE; measured in milliseconds since Th, 01, Jan 1970
+  -s, --skip SKIP     exclude the first SKIP number of activations from the result
+      --upto UPTO     return activations with timestamps earlier than UPTO; measured in milliseconds since Th, 01, Jan 1970
+```
+
+For example, to list the last 6 activations:
+```
+wsk activation list --limit 6
+```
+<pre>
+Datetime            Activation ID                    Kind      Start Duration   Status  Entity
+2019-03-16 20:03:00 8690bc9904794c9390bc9904794c930e nodejs:6  warm  2ms        success guest/tripleAndIncrement:0.0.1
+2019-03-16 20:02:59 7e76452bec32401db6452bec32001d68 nodejs:6  cold  32ms       success guest/increment:0.0.1
+2019-03-16 20:02:59 097250ad10a24e1eb250ad10a23e1e96 nodejs:6  warm  2ms        success guest/tripleAndIncrement:0.0.1
+2019-03-16 20:02:58 4991a50ed9ed4dc091a50ed9edddc0bb nodejs:6  cold  33ms       success guest/triple:0.0.1
+2019-03-16 20:02:57 aee63124f3504aefa63124f3506aef8b nodejs:6  cold  34ms       success guest/tripleAndIncrement:0.0.1
+2019-03-16 20:02:57 22da217c8e3a4b799a217c8e3a0b79c4 sequence  warm  3.46s      success guest/tripleAndIncrement:0.0.1
+</pre>
+
+The meaning of the different columns in the list are:
+
+| Column | Description |
+| :--- | :--- |
+| `Datetime` | The date and time when the invocation occurred. |
+| `Activation ID` | An activation ID that can be used to retrive the result using the `wsk activation get`, `wsk activation result` and `wsk activation logs` commands. |
+| `Kind` | The runtime or action type |
+| `Start` | An indication of the latency, i.e. if the runtime container was cold or warm started. |
+| `Duration` | Time taken to execute the invocation. |
+| `Status` | The outcome of the invocation. For an explanation of the various statuses, see the description of the `statusCode` below. |
+| `Entity` | The fully qualified name of entity that was invoked. |
+
+#### Understanding the activation record
 
 Each action invocation results in an activation record which contains the following fields:
 
@@ -247,15 +305,16 @@ Each action invocation results in an activation record which contains the follow
       - the action specified a wrong docker container name
       - the action did not properly implement the expected [runtime protocol](actions-new.md)
     - *"whisk internal error"*: the system was unable to invoke the action.
+  - `statusCode`: A value between 0 and 3 that maps to the activation result, as described by the *status* field:
+
+    | statusCode | status                 |
+    |:---------- |:---------------------- |
+    | 0          | success                |
+    | 1          | application error      |
+    | 2          | action developer error |
+    | 3          | whisk internal error   |
   - `success`: Is *true* if and only if the status is *"success"*.
   - `result`: A dictionary as a JSON object which contains the activation result. If the activation was successful, this contains the value that is returned by the action. If the activation was unsuccessful, `result` contains the `error` key, generally with an explanation of the failure.
-
-Some common CLI commands for working with activations are:
-- `wsk activation list`: lists all activations
-- `wsk activation get --last`: retrieves the most recent activation record
-- `wsk activation result <activationId>`: retrieves only the result of the activation (or use `--last` to get the most recent result).
-- `wsk activation logs <activationId>`: retrieves only the logs of the activation.
-- `wsk activation logs <activationId> --strip`: strips metadata from each log line so the logs are easier to read.
 
 ### Creating and updating your own action
 
@@ -280,7 +339,7 @@ ok: updated action greeting
 
 Sometimes it is necessary or just convenient to provide values for function parameters. These can serve as
 defaults, or as a way of reusing an action but with different parameters. Parameters can be bound to an action
-and unless overriden later by an invocation, they will provide the specified value to the function.
+and unless overridden later by an invocation, they will provide the specified value to the function.
 
 Here is an example.
 
@@ -301,7 +360,7 @@ wsk action invoke greeting --result
 }
 ```
 
-You may still provide additional parmaeters, as in the `place`:
+You may still provide additional parameters, as in the `place`:
 ```
 wsk action invoke greeting --result --param place Kansas
 {
@@ -320,7 +379,7 @@ wsk action invoke greeting --result --param place Kansas --param name Dorothy
 
 When an invocation request is received, the system records the request and dispatches an activation.
 
-The system returns an activation ID (in the case of a nonblocking invocation) to confirm that the invocation was received.
+The system returns an activation ID (in the case of a non-blocking invocation) to confirm that the invocation was received.
 Notice that if there's a network failure or other failure which intervenes before you receive an HTTP response, it is possible
 that OpenWhisk received and processed the request.
 
@@ -566,7 +625,7 @@ Notice that the list is now sorted alphabetically by namespace, then package nam
 As you write more actions, this list gets longer and it can be helpful to group related actions into [packages](packages.md). To filter your list of actions to just those within a specific package, you can use:
 
 ```
-wsk action list action list /whisk.system/utils
+wsk action list /whisk.system/utils
 ```
 ```
 actions
@@ -608,9 +667,10 @@ or set an internal alarm when the action is about to use up its allotted time bu
 The properties are accessible via the system environment for all supported runtimes:
 Node.js, Python, Swift, Java and Docker actions when using the OpenWhisk Docker skeleton.
 
-* `__OW_API_HOST` the API host for the OpenWhisk deployment running this action
-* `__OW_API_KEY` the API key for the subject invoking the action, this key may be a restricted API key
-* `__OW_NAMESPACE` the namespace for the _activation_ (this may not be the same as the namespace for the action)
-* `__OW_ACTION_NAME` the fully qualified name of the running action
-* `__OW_ACTIVATION_ID` the activation id for this running action instance
-* `__OW_DEADLINE` the approximate time when this action will have consumed its entire duration quota (measured in epoch milliseconds)
+* `__OW_API_HOST` the API host for the OpenWhisk deployment running this action.
+* `__OW_API_KEY` the API key for the subject invoking the action, this key may be a restricted API key. This property is absent unless explicitly [requested](./annotations.md#annotations-for-all-actions).
+* `__OW_NAMESPACE` the namespace for the _activation_ (this may not be the same as the namespace for the action).
+* `__OW_ACTION_NAME` the fully qualified name of the running action.
+* `__OW_ACTION_VERSION` the internal version number of the running action.
+* `__OW_ACTIVATION_ID` the activation id for this running action instance.
+* `__OW_DEADLINE` the approximate time when this action will have consumed its entire duration quota (measured in epoch milliseconds).

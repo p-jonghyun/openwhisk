@@ -17,16 +17,17 @@
 
 package org.apache.openwhisk.core.entity
 
+import java.time.Instant
+
 import scala.concurrent.ExecutionContext
 import scala.concurrent.Future
 import scala.language.postfixOps
 import scala.util.Try
-
 import spray.json.DefaultJsonProtocol
 import spray.json.DefaultJsonProtocol._
 import spray.json._
 import org.apache.openwhisk.common.TransactionId
-import org.apache.openwhisk.core.database.DocumentFactory
+import org.apache.openwhisk.core.database.{ArtifactStore, CacheChangeNotification, DocumentFactory}
 import org.apache.openwhisk.core.entity.types.EntityStore
 
 /**
@@ -60,7 +61,8 @@ case class WhiskPackagePut(binding: Option[Binding] = None,
  * @param parameters the set of parameters to bind to the action environment
  * @param version the semantic version
  * @param publish true to share the action or false otherwise
- * @param annotation the set of annotations to attribute to the package
+ * @param annotations the set of annotations to attribute to the package
+ * @param updated the timestamp when the package is updated
  * @throws IllegalArgumentException if any argument is undefined
  */
 @throws[IllegalArgumentException]
@@ -70,7 +72,8 @@ case class WhiskPackage(namespace: EntityPath,
                         parameters: Parameters = Parameters(),
                         version: SemVer = SemVer(),
                         publish: Boolean = false,
-                        annotations: Parameters = Parameters())
+                        annotations: Parameters = Parameters(),
+                        override val updated: Instant = WhiskEntity.currentMillis())
     extends WhiskEntity(name, "package") {
 
   require(binding != null || (binding map { _ != null } getOrElse true), "binding undefined")
@@ -119,14 +122,8 @@ case class WhiskPackage(namespace: EntityPath,
    * for this check.
    */
   def withPackageActions(actions: List[WhiskPackageAction] = List.empty): WhiskPackageWithActions = {
-    val actionGroups = actions map { a =>
-      //  group into "actions" and "feeds"
-      val feed = a.annotations.get(Parameters.Feed) map { _ =>
-        true
-      } getOrElse false
-      (feed, a)
-    } groupBy { _._1 } mapValues { _.map(_._2) }
-    WhiskPackageWithActions(this, actionGroups.getOrElse(false, List.empty), actionGroups.getOrElse(true, List.empty))
+    val (feedActions, nonFeedActions) = actions.partition(_.annotations.get(Parameters.Feed).isDefined)
+    WhiskPackageWithActions(this, nonFeedActions, feedActions)
   }
 
   def toJson = WhiskPackage.serdes.write(this).asJsObject
@@ -138,7 +135,7 @@ case class WhiskPackage(namespace: EntityPath,
   override def summaryAsJson = {
     JsObject(
       super.summaryAsJson.fields +
-        (WhiskPackage.bindingFieldName -> binding.map(Binding.serdes.write(_)).getOrElse(JsBoolean(false))))
+        (WhiskPackage.bindingFieldName -> binding.map(Binding.serdes.write(_)).getOrElse(JsFalse)))
   }
 }
 
@@ -158,6 +155,8 @@ object WhiskPackage
     extends DocumentFactory[WhiskPackage]
     with WhiskEntityQueries[WhiskPackage]
     with DefaultJsonProtocol {
+
+  import WhiskActivation.instantSerdes
 
   val bindingFieldName = "binding"
   override val collectionName = "packages"
@@ -197,12 +196,17 @@ object WhiskPackage
       override def write(b: Option[Binding]) = Binding.optionalBindingSerializer.write(b)
       override def read(js: JsValue) = Binding.optionalBindingDeserializer.read(js)
     }
-    jsonFormat7(WhiskPackage.apply)
+    jsonFormat8(WhiskPackage.apply)
   }
-
   override val cacheEnabled = true
 
-  lazy val publicPackagesView: View = WhiskEntityQueries.view(collection = s"$collectionName-public")
+  lazy val publicPackagesView: View = WhiskQueries.entitiesView(collection = s"$collectionName-public")
+  // overriden to store encrypted parameters.
+  override def put[A >: WhiskPackage](db: ArtifactStore[A], doc: WhiskPackage, old: Option[WhiskPackage])(
+    implicit transid: TransactionId,
+    notifier: Option[CacheChangeNotification]): Future[DocInfo] = {
+    super.put(db, doc.copy(parameters = ParameterEncryption.lock(doc.parameters)).revision[WhiskPackage](doc.rev), old)
+  }
 }
 
 /**

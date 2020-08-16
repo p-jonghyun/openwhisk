@@ -20,7 +20,7 @@ package org.apache.openwhisk.core.database.test.behavior
 import java.time.Instant
 
 import org.apache.openwhisk.common.TransactionId
-import org.apache.openwhisk.core.database.{DocumentConflictException, NoDocumentException}
+import org.apache.openwhisk.core.database.{DocumentConflictException, DocumentProvider, NoDocumentException}
 import org.apache.openwhisk.core.entity._
 
 trait ArtifactStoreCRUDBehaviors extends ArtifactStoreBehaviorBase {
@@ -42,6 +42,20 @@ trait ArtifactStoreCRUDBehaviors extends ArtifactStoreBehaviorBase {
       getWhiskAuth(doc)
         .copy(namespaces = Set(wskNS("foo1")))
         .revision[WhiskAuth](doc.rev)
+    val doc2 = put(authStore, auth2)
+
+    doc2.rev should not be doc.rev
+    doc2.rev.empty shouldBe false
+  }
+
+  it should "put delete and then recreate document with same id with different rev" in {
+    implicit val tid: TransactionId = transid()
+    val auth = newAuth()
+    val doc = put(authStore, auth)
+
+    delete(authStore, doc) shouldBe true
+
+    val auth2 = auth.copy(namespaces = Set(wskNS("foo1")))
     val doc2 = put(authStore, auth2)
 
     doc2.rev should not be doc.rev
@@ -71,6 +85,22 @@ trait ArtifactStoreCRUDBehaviors extends ArtifactStoreBehaviorBase {
     intercept[DocumentConflictException] {
       put(authStore, auth)
     }
+  }
+
+  it should "work if same document was deleted earlier" in {
+    implicit val tid: TransactionId = transid()
+    val auth = newAuth()
+    //1. Create a document
+    val doc = put(authStore, auth)
+
+    //2. Now delete the document
+    delete(authStore, doc) shouldBe true
+
+    //3. Now recreate the same document.
+    val doc2 = put(authStore, auth)
+
+    //Recreating a deleted document should work
+    doc2.rev.empty shouldBe false
   }
 
   behavior of s"${storeType}ArtifactStore delete"
@@ -134,8 +164,8 @@ trait ArtifactStoreCRUDBehaviors extends ArtifactStoreBehaviorBase {
       EntityName("activation1"),
       Subject(),
       ActivationId.generate(),
-      start = Instant.now,
-      end = Instant.now)
+      start = Instant.now.inMills,
+      end = Instant.now.inMills)
     val activationDoc = put(activationStore, activation)
     val activationFromDb = activationStore.get[WhiskActivation](activationDoc).futureValue
     activationFromDb shouldBe activation
@@ -158,5 +188,25 @@ trait ArtifactStoreCRUDBehaviors extends ArtifactStoreBehaviorBase {
   it should "throws NoDocumentException when document does not exist" in {
     implicit val tid: TransactionId = transid()
     authStore.get[WhiskAuth](DocInfo("non-existing-doc")).failed.futureValue shouldBe a[NoDocumentException]
+  }
+
+  it should "not get a deleted document" in {
+    implicit val tid: TransactionId = transid()
+    val auth = newAuth()
+    //1. Create a document
+    val docInfo = put(authStore, auth)
+
+    //2. Now delete the document
+    delete(authStore, docInfo) shouldBe true
+
+    //3. Now getting a deleted document should fail
+    authStore.get[WhiskAuth](docInfo).failed.futureValue shouldBe a[NoDocumentException]
+
+    //Check get by id flow also which return none for such "soft" deleted document
+    authStore match {
+      case provider: DocumentProvider =>
+        provider.get(docInfo.id).futureValue shouldBe None
+      case _ =>
+    }
   }
 }

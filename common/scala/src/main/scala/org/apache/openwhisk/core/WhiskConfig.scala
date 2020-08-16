@@ -19,19 +19,22 @@ package org.apache.openwhisk.core
 
 import java.io.File
 
-import scala.io.Source
+import akka.http.scaladsl.model.Uri.normalize
 import org.apache.openwhisk.common.{Config, Logging}
+
+import scala.io.Source
+import scala.util.Try
 
 /**
  * A set of properties which might be needed to run a whisk microservice implemented
  * in scala.
  *
  * @param requiredProperties a Map whose keys define properties that must be bound to
- * a value, and whose values are default values. A null value in the Map means there is
- * no default value specified, so it must appear in the properties file.
+ *                           a value, and whose values are default values. A null value in the Map means there is
+ *                           no default value specified, so it must appear in the properties file.
  * @param optionalProperties a set of optional properties (which may not be defined).
- * @param propertiesFile a File object, the whisk.properties file, which if given contains the property values.
- * @param env an optional environment to initialize from.
+ * @param propertiesFile     a File object, the whisk.properties file, which if given contains the property values.
+ * @param env                an optional environment to initialize from.
  */
 class WhiskConfig(requiredProperties: Map[String, String],
                   optionalProperties: Set[String] = Set.empty,
@@ -46,18 +49,24 @@ class WhiskConfig(requiredProperties: Map[String, String],
    */
   override protected def getProperties() = {
     val properties = super.getProperties()
-    WhiskConfig.readPropertiesFromFile(properties, Option(propertiesFile) getOrElse (WhiskConfig.whiskPropertiesFile))
+    if (!disableReadFromFile()) {
+      WhiskConfig.readPropertiesFromFile(properties, Option(propertiesFile) getOrElse (WhiskConfig.whiskPropertiesFile))
+    }
     properties
   }
+
+  private def disableReadFromFile() = java.lang.Boolean.getBoolean(WhiskConfig.disableWhiskPropsFileRead)
 
   val servicePort = this(WhiskConfig.servicePort)
   val dockerEndpoint = this(WhiskConfig.dockerEndpoint)
   val dockerPort = this(WhiskConfig.dockerPort)
 
-  val wskApiHost = this(WhiskConfig.wskApiProtocol) + "://" + this(WhiskConfig.wskApiHostname) + ":" + this(
-    WhiskConfig.wskApiPort)
+  val wskApiHost: String = Try(
+    normalize(
+      s"${this(WhiskConfig.wskApiProtocol)}://${this(WhiskConfig.wskApiHostname)}:${this(WhiskConfig.wskApiPort)}"))
+    .getOrElse("")
+
   val controllerBlackboxFraction = this.getAsDouble(WhiskConfig.controllerBlackboxFraction, 0.10)
-  val controllerInstances = this(WhiskConfig.controllerInstances)
 
   val edgeHost = this(WhiskConfig.edgeHostName) + ":" + this(WhiskConfig.edgeHostApiPort)
   val kafkaHosts = this(WhiskConfig.kafkaHostList)
@@ -70,7 +79,6 @@ class WhiskConfig(requiredProperties: Map[String, String],
   val dbPrefix = this(WhiskConfig.dbPrefix)
   val mainDockerEndpoint = this(WhiskConfig.mainDockerEndpoint)
 
-  val runtimesRegistry = this(WhiskConfig.runtimesRegistry)
   val runtimesManifest = this(WhiskConfig.runtimesManifest)
   val actionInvokePerMinuteLimit = this(WhiskConfig.actionInvokePerMinuteLimit)
   val actionInvokeConcurrentLimit = this(WhiskConfig.actionInvokeConcurrentLimit)
@@ -80,6 +88,7 @@ class WhiskConfig(requiredProperties: Map[String, String],
 }
 
 object WhiskConfig {
+  val disableWhiskPropsFileRead = Config.prefix + "disable.whisks.props.file.read"
 
   /**
    * Reads a key from system environment as if it was part of WhiskConfig.
@@ -159,13 +168,12 @@ object WhiskConfig {
   val mainDockerEndpoint = "main.docker.endpoint"
 
   val controllerBlackboxFraction = "controller.blackboxFraction"
-  val controllerInstances = "controller.instances"
   val dbInstances = "db.instances"
 
   val kafkaHostList = "kafka.hosts"
   val zookeeperHostList = "zookeeper.hosts"
 
-  private val edgeHostApiPort = "edge.host.apiport"
+  val edgeHostApiPort = "edge.host.apiport"
 
   val invokerHostsList = "invoker.hosts"
   val dbHostsList = "db.hostsList"
@@ -175,7 +183,6 @@ object WhiskConfig {
   val kafkaHosts = Map(kafkaHostList -> null)
   val zookeeperHosts = Map(zookeeperHostList -> null)
 
-  val runtimesRegistry = "runtimes.registry"
   val runtimesManifest = "runtimes.manifest"
 
   val actionSequenceMaxLimit = "limits.actions.sequence.maxLength"
@@ -213,6 +220,7 @@ object ConfigKeys {
   val docker = "whisk.docker"
   val dockerClient = s"$docker.client"
   val dockerContainerFactory = s"$docker.container-factory"
+  val standaloneDockerContainerFactory = s"$docker.standalone.container-factory"
   val runc = "whisk.runc"
   val runcTimeouts = s"$runc.timeouts"
 
@@ -220,6 +228,8 @@ object ConfigKeys {
 
   val containerFactory = "whisk.container-factory"
   val containerArgs = s"$containerFactory.container-args"
+  val runtimesRegistry = s"$containerFactory.runtimes-registry"
+  val userImagesRegistry = s"$containerFactory.user-images-registry"
   val containerPool = "whisk.container-pool"
   val blacklist = "whisk.blacklist"
 
@@ -233,9 +243,11 @@ object ConfigKeys {
   val logStoreElasticSearch = s"$logStore.elasticsearch"
 
   val mesos = "whisk.mesos"
+  val yarn = "whisk.yarn"
 
   val containerProxy = "whisk.container-proxy"
   val containerProxyTimeouts = s"$containerProxy.timeouts"
+  val containerProxyHealth = s"$containerProxy.action-health-check"
 
   val s3 = "whisk.s3"
   val query = "whisk.query-limit"
@@ -245,6 +257,19 @@ object ConfigKeys {
   val controllerActivation = s"$controller.activation"
 
   val activationStore = "whisk.activation-store"
+  val elasticSearchActivationStore = s"$activationStore.elasticsearch"
   val activationStoreWithFileStorage = s"$activationStore.with-file-storage"
 
+  val metrics = "whisk.metrics"
+  val featureFlags = "whisk.feature-flags"
+
+  val whiskConfig = "whisk.config"
+  val swaggerUi = "whisk.swagger-ui"
+
+  val disableStoreResult = s"$activation.disable-store-result"
+  val unstoredLogsEnabled = s"$activation.unstored-logs-enabled"
+
+  val apacheClientConfig = "whisk.apache-client"
+
+  val parameterStorage = "whisk.parameter-storage"
 }

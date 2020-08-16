@@ -19,10 +19,14 @@ package org.apache.openwhisk.core.database.cosmosdb
 
 import com.microsoft.azure.cosmosdb.internal.Constants.Properties.{AGGREGATE, E_TAG, ID, SELF_LINK}
 import org.apache.openwhisk.core.database.cosmosdb.CosmosDBConstants._
-
-import scala.collection.immutable.Iterable
+import org.apache.openwhisk.core.database.StoreUtils.transform
+import spray.json.{JsObject, JsString}
 
 private[cosmosdb] object CosmosDBConstants {
+
+  /**
+   * Stores the computed properties required for view related queries
+   */
   val computed: String = "_c"
 
   val alias: String = "view"
@@ -34,9 +38,30 @@ private[cosmosdb] object CosmosDBConstants {
   val aggregate: String = AGGREGATE
 
   val selfLink: String = SELF_LINK
+
+  /**
+   * Records the clusterId which performed changed in any document. This can vary over
+   * lifetime of a document as different clusters may change the same document at different times
+   */
+  val clusterId: String = "_clusterId"
+
+  /**
+   * Property indicating that document has been marked as deleted with ttl
+   */
+  val deleted: String = "_deleted"
 }
 
 private[cosmosdb] trait CosmosDBUtil {
+
+  /**
+   * Name of `id` field as used in WhiskDocument
+   */
+  val _id: String = "_id"
+
+  /**
+   * Name of revision field as used in WhiskDocument
+   */
+  val _rev: String = "_rev"
 
   /**
    * Prepares the json like select clause
@@ -46,37 +71,19 @@ private[cosmosdb] trait CosmosDBUtil {
    * }}}
    * Here it uses {{{r['keyName']}}} notation to avoid issues around using reserved words as field name
    */
-  def prepareFieldClause(fields: Iterable[String]): String = {
-    val m = fields.foldLeft(Map.empty[String, Any]) { (map, name) =>
-      addToMap(name, map)
-    }
-    val withId = addToMap(cid, m)
-    val json = asJsonLikeString(withId)
+  def prepareFieldClause(fields: Set[String]): String = {
+    val json = (fields + cid)
+      .map { field =>
+        val split = field.split('.')
+
+        val selector = "r" + split.mkString("['", "']['", "']")
+        val prefix = split.map(k => s""""$k":""").mkString("{")
+        val suffix = split.drop(1).map(_ => "}").mkString
+
+        prefix + selector + suffix
+      }
+      .mkString("{", ",", "}")
     s"$json AS $alias"
-  }
-
-  private def addToMap(name: String, map: Map[String, _]): Map[String, Any] = name.split('.').toList match {
-    case Nil     => throw new IllegalStateException(s"'$name' split on '.' should not result in empty list")
-    case x :: xs => addToMap(x, xs, Nil, map)
-  }
-
-  private def addToMap(key: String,
-                       children: List[String],
-                       keyPath: List[String],
-                       map: Map[String, Any]): Map[String, Any] = children match {
-    case Nil => map + (key -> s"r${makeKeyPath(key :: keyPath)}")
-    case x :: xs =>
-      map + (key -> addToMap(x, xs, key :: keyPath, map.getOrElse(key, Map.empty).asInstanceOf[Map[String, Any]]))
-  }
-
-  private def makeKeyPath(keyPath: List[String]) = keyPath.reverse.map(f => s"['$f']").mkString
-
-  private def asJsonLikeString(m: Map[_, _]) =
-    m.map { case (k, v) => s""" "$k" : ${asString(v)}""" }.mkString("{", ",", "}")
-
-  private def asString(v: Any): String = v match {
-    case m: Map[_, _] => asJsonLikeString(m)
-    case x            => x.toString
   }
 
   /**
@@ -91,6 +98,16 @@ private[cosmosdb] trait CosmosDBUtil {
   def unescapeId(id: String): String = {
     require(!id.contains("/"), s"Escaped Id [$id] should not contain '/'")
     id.replace("|", "/")
+  }
+
+  def toWhiskJsonDoc(js: JsObject, id: String, etag: Option[JsString]): JsObject = {
+    val fieldsToAdd = Seq((_id, Some(JsString(unescapeId(id)))), (_rev, etag))
+    transform(stripInternalFields(js), fieldsToAdd, Seq.empty)
+  }
+
+  private def stripInternalFields(js: JsObject) = {
+    //Strip out all field name starting with '_' which are considered as db specific internal fields
+    JsObject(js.fields.filter { case (k, _) => !k.startsWith("_") && k != cid })
   }
 
 }

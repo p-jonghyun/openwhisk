@@ -33,7 +33,7 @@ import common.StreamLogging
 import org.junit.runner.RunWith
 import org.scalatest.concurrent.ScalaFutures
 import org.scalatest.junit.JUnitRunner
-import org.scalatest.{FlatSpecLike, Matchers}
+import org.scalatest.{BeforeAndAfterAll, FlatSpecLike, Matchers}
 import pureconfig.error.ConfigReaderException
 import spray.json._
 import org.apache.openwhisk.core.entity._
@@ -49,10 +49,16 @@ class SplunkLogStoreTests
     extends TestKit(ActorSystem("SplunkLogStore"))
     with FlatSpecLike
     with Matchers
+    with BeforeAndAfterAll
     with ScalaFutures
     with StreamLogging {
 
   def await[T](awaitable: Future[T], timeout: FiniteDuration = 10.seconds) = Await.result(awaitable, timeout)
+
+  override def afterAll(): Unit = {
+    TestKit.shutdownActorSystem(system)
+    super.afterAll()
+  }
 
   val testConfig = SplunkLogStoreConfig(
     "splunk-host",
@@ -63,9 +69,12 @@ class SplunkLogStoreTests
     "log_timestamp",
     "log_stream",
     "log_message",
+    "namespace",
     "activation_id",
     "somefield::somevalue",
-    22,
+    10.seconds,
+    7.days,
+    22.seconds,
     disableSNI = false)
 
   behavior of "Splunk LogStore"
@@ -76,7 +85,7 @@ class SplunkLogStoreTests
   val endTimePlusOffset = "2007-12-03T10:16:07Z" //queried end time range is endTime+22
   val uuid = UUID()
   val user =
-    Identity(Subject(), Namespace(EntityName("testSpace"), uuid), BasicAuthenticationAuthKey(uuid, Secret()), Set.empty)
+    Identity(Subject(), Namespace(EntityName("testSpace"), uuid), BasicAuthenticationAuthKey(uuid, Secret()))
   val request = HttpRequest(
     method = POST,
     uri = "https://some.url",
@@ -112,6 +121,7 @@ class SplunkLogStoreTests
               val outputMode = form.fields.get("output_mode")
               val search = form.fields.get("search")
               val execMode = form.fields.get("exec_mode")
+              val maxTime = form.fields.get("max_time")
 
               request.uri.path.toString() shouldBe "/services/search/jobs"
               request.headers shouldBe List(Authorization.basic(testConfig.username, testConfig.password))
@@ -119,8 +129,9 @@ class SplunkLogStoreTests
               latestTime shouldBe Some(endTimePlusOffset)
               outputMode shouldBe Some("json")
               execMode shouldBe Some("oneshot")
+              maxTime shouldBe Some("10")
               search shouldBe Some(
-                s"""search index="${testConfig.index}"| spath ${testConfig.activationIdField}| search ${testConfig.queryConstraints} ${testConfig.activationIdField}=${activation.activationId.toString}| table ${testConfig.logTimestampField}, ${testConfig.logStreamField}, ${testConfig.logMessageField}| reverse""")
+                s"""search index="${testConfig.index}" | search ${testConfig.queryConstraints} | search ${testConfig.namespaceField}=${activation.namespace.asString} | search ${testConfig.activationIdField}=${activation.activationId.toString} | spath ${testConfig.logMessageField} | table ${testConfig.logTimestampField}, ${testConfig.logStreamField}, ${testConfig.logMessageField} | reverse""")
 
               (
                 Success(
@@ -128,7 +139,7 @@ class SplunkLogStoreTests
                     StatusCodes.OK,
                     entity = HttpEntity(
                       ContentTypes.`application/json`,
-                      """{"preview":false,"init_offset":0,"messages":[],"fields":[{"name":"log_message"}],"results":[{"log_timestamp": "2007-12-03T10:15:30Z", "log_stream":"stdout", "log_message":"some log message"},{"log_timestamp": "2007-12-03T10:15:31Z", "log_stream":"stderr", "log_message":"some other log message"}], "highlighted":{}}"""))),
+                      """{"preview":false,"init_offset":0,"messages":[],"fields":[{"name":"log_message"}],"results":[{"log_timestamp": "2007-12-03T10:15:30Z", "log_stream":"stdout", "log_message":"some log message"},{"log_timestamp": "2007-12-03T10:15:31Z", "log_stream":"stderr", "log_message":"some other log message"},{},{"log_timestamp": "2007-12-03T10:15:32Z", "log_stream":"stderr"}], "highlighted":{}}"""))),
                 userContext)
             }
             .recover {
@@ -152,23 +163,34 @@ class SplunkLogStoreTests
   it should "find logs based on activation timestamps" in {
     //use the a flow that asserts the request structure and provides a response in the expected format
     val splunkStore = new SplunkLogStore(system, Some(testFlow), testConfig)
-    val result = await(splunkStore.fetchLogs(activation, context))
+    val result = await(
+      splunkStore.fetchLogs(
+        activation.namespace.asString,
+        activation.activationId,
+        Some(activation.start),
+        Some(activation.end),
+        None,
+        context))
     result shouldBe ActivationLogs(
       Vector(
         "2007-12-03T10:15:30Z           stdout: some log message",
-        "2007-12-03T10:15:31Z           stderr: some other log message"))
+        "2007-12-03T10:15:31Z           stderr: some other log message",
+        "The log message can't be retrieved, key not found: log_timestamp",
+        "The log message can't be retrieved, key not found: log_message"))
   }
 
   it should "fail to connect to bogus host" in {
     //use the default http flow with the default bogus-host config
     val splunkStore = new SplunkLogStore(system, splunkConfig = testConfig)
-    a[Throwable] should be thrownBy await(splunkStore.fetchLogs(activation, context))
+    a[Throwable] should be thrownBy await(
+      splunkStore.fetchLogs(activation.namespace.asString, activation.activationId, None, None, None, context))
   }
 
   it should "display an error if API cannot be reached" in {
     //use a flow that generates a 500 response
     val splunkStore = new SplunkLogStore(system, Some(failFlow), testConfig)
-    a[RuntimeException] should be thrownBy await(splunkStore.fetchLogs(activation, context))
+    a[RuntimeException] should be thrownBy await(
+      splunkStore.fetchLogs(activation.namespace.asString, activation.activationId, None, None, None, context))
   }
 
 }

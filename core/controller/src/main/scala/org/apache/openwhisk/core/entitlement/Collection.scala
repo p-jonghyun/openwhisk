@@ -37,15 +37,15 @@ import org.apache.openwhisk.core.entity.WhiskRule
 import org.apache.openwhisk.core.entity.WhiskTrigger
 import org.apache.openwhisk.core.entity.types.EntityStore
 import pureconfig._
+import pureconfig.generic.auto._
 
 /**
  * A collection encapsulates the name of a collection and implicit rights when subject
  * lacks explicit rights on a resource in the collection.
  *
  * @param path the name of the collection (the resource path in URI and the view name in the datastore)
- * @param activate the privilege for an activate (may be ACTIVATE or REJECT for example)
- * @param listLimit the default limit on number of entities returned from a collection on a list operation
- * @param skipLimit the default skip on number of entities returned from a collection on a list operation
+ * @param defaultListLimit the default limit on number of entities returned from a collection on a list operation
+ * @param defaultListSkip the default skip on number of entities returned from a collection on a list operation
  */
 protected[core] case class Collection protected (val path: String,
                                                  val defaultListLimit: Int = Collection.DEFAULT_LIST_LIMIT,
@@ -123,6 +123,7 @@ protected[core] object Collection {
   protected[core] val PACKAGES = WhiskPackage.collectionName
   protected[core] val ACTIVATIONS = WhiskActivation.collectionName
   protected[core] val NAMESPACES = "namespaces"
+  protected[core] val LIMITS = "limits"
 
   private val collections = scala.collection.mutable.Map[String, Collection]()
   private def register(c: Collection) = collections += c.path -> c
@@ -155,6 +156,13 @@ protected[core] object Collection {
       }
 
       protected override val allowedEntityRights: Set[Privilege] = Set(Privilege.READ)
+    })
+
+    register(new Collection(LIMITS) {
+      protected[core] override def determineRight(op: HttpMethod,
+                                                  resource: Option[String])(implicit transid: TransactionId) = {
+        if (op == GET) Privilege.READ else Privilege.REJECT
+      }
     })
   }
 }

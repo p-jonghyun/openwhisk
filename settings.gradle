@@ -19,6 +19,9 @@ include 'common:scala'
 
 include 'core:controller'
 include 'core:invoker'
+include 'core:cosmosdb:cache-invalidator'
+include 'core:standalone'
+include 'core:monitoring:user-events'
 
 include 'tests'
 include 'tests:performance:gatling_tests'
@@ -31,21 +34,36 @@ include 'tools:admin'
 
 rootProject.name = 'openwhisk'
 
-gradle.ext.scala = [
-    version: '2.12.7',
-    compileFlags: ['-feature', '-unchecked', '-deprecation', '-Xfatal-warnings', '-Ywarn-unused-import']
-]
+
+def scalaVersion = System.getenv().getOrDefault('OW_SCALA_VERSION', '2.12')
+
+if (scalaVersion == '2.12') {
+    println("Build using Scala 2.12")
+    gradle.ext.scala = [
+            version     : '2.12.10',
+            depVersion  : '2.12',
+            compileFlags: ['-feature', '-unchecked', '-deprecation', '-Xfatal-warnings', '-Ywarn-unused-import']
+    ]
+} else {
+    println("Build using Scala 2.13")
+    gradle.ext.scala = [
+            version     : '2.13.1',
+            depVersion  : '2.13',
+            // We can't use fatal warnings yet because there are deprecated things in 2.13 that are not fixable
+            // in 2.12.
+            compileFlags: ['-feature', '-unchecked', '-deprecation']
+    ]
+}
 
 gradle.ext.scalafmt = [
     version: '1.5.0',
     config: new File(rootProject.projectDir, '.scalafmt.conf')
 ]
 
-gradle.ext.scoverage = [
-    deps: [
-        'org.scoverage:scalac-scoverage-plugin_2.12:1.3.1',
-        'org.scoverage:scalac-scoverage-runtime_2.12:1.3.1'
-    ]
-]
+gradle.ext.akka = [version : '2.5.26']
+gradle.ext.akka_kafka = [version : '2.0.2']
+gradle.ext.akka_http = [version : '10.1.11']
+gradle.ext.akka_management = [version : '1.0.5']
 
-gradle.ext.curator = [version:'4.0.0']
+gradle.ext.curator = [version : '4.0.0']
+gradle.ext.kube_client = [version: '4.4.2']

@@ -24,7 +24,8 @@ import akka.http.scaladsl.model.Uri
 import akka.http.scaladsl.server.directives.AuthenticationDirective
 import akka.http.scaladsl.server.{Directives, Route}
 import akka.stream.ActorMaterializer
-import pureconfig.loadConfigOrThrow
+import pureconfig._
+import pureconfig.generic.auto._
 import spray.json.DefaultJsonProtocol._
 import spray.json._
 import org.apache.openwhisk.common.{Logging, TransactionId}
@@ -48,10 +49,12 @@ import scala.util.{Failure, Success, Try}
  */
 protected[controller] class SwaggerDocs(apipath: Uri.Path, doc: String)(implicit actorSystem: ActorSystem)
     extends Directives {
+  case class SwaggerConfig(fileSystem: Boolean, dirPath: String)
 
   /** Swagger end points. */
   protected val swaggeruipath = "docs"
   protected val swaggerdocpath = "api-docs"
+  private val swaggerConfig = loadConfigOrThrow[SwaggerConfig](ConfigKeys.swaggerUi)
 
   def basepath(url: Uri.Path = apipath): String = {
     (if (url.startsWithSlash) url else Uri.Path./(url)).toString
@@ -62,7 +65,8 @@ protected[controller] class SwaggerDocs(apipath: Uri.Path, doc: String)(implicit
    */
   val swaggerRoutes: Route = {
     pathPrefix(swaggeruipath) {
-      getFromDirectory("/swagger-ui/")
+      if (swaggerConfig.fileSystem) getFromDirectory(swaggerConfig.dirPath)
+      else getFromResourceDirectory(swaggerConfig.dirPath)
     } ~ path(swaggeruipath) {
       redirect(s"$swaggeruipath/index.html?url=$apiDocsUrl", PermanentRedirect)
     } ~ pathPrefix(swaggerdocpath) {
@@ -202,7 +206,8 @@ class RestAPIVersion(config: WhiskConfig, apiPath: String, apiVersion: String)(
                   triggers.routes(user) ~
                   rules.routes(user) ~
                   activations.routes(user) ~
-                  packages.routes(user)
+                  packages.routes(user) ~
+                  limits.routes(user)
               }
           } ~
           swaggerRoutes
@@ -229,9 +234,16 @@ class RestAPIVersion(config: WhiskConfig, apiPath: String, apiVersion: String)(
   private val triggers = new TriggersApi(apiPath, apiVersion)
   private val activations = new ActivationsApi(apiPath, apiVersion)
   private val rules = new RulesApi(apiPath, apiVersion)
+  private val limits = new LimitsApi(apiPath, apiVersion)
   private val web = new WebActionsApi(Seq("web"), new WebApiDirectives())
 
   class NamespacesApi(val apiPath: String, val apiVersion: String) extends WhiskNamespacesApi
+
+  class LimitsApi(val apiPath: String, val apiVersion: String)(
+    implicit override val entitlementProvider: EntitlementProvider,
+    override val executionContext: ExecutionContext,
+    override val whiskConfig: WhiskConfig)
+      extends WhiskLimitsApi
 
   class ActionsApi(val apiPath: String, val apiVersion: String)(
     implicit override val actorSystem: ActorSystem,

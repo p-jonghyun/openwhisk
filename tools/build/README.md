@@ -30,6 +30,7 @@ The script is called `redo` because for most development, one will want to "redo
 - usage information: `redo -h`
 - initialize environment and `docker-machine` (for mac): `redo setup prereq`
 - start CouchDB container and initialize DB with system and guest keys: `redo couchdb initdb`
+- start ElasticSearch container to store activations: `redo elasticsearch`
 - build and deploy system: `redo deploy`
 - run tests: `redo props tests`
 
@@ -51,7 +52,7 @@ Some components are dynamically generated. This is supported by a generic compon
 which specifies a regex. The `runtime:([\w]+)` is one such component, useful for rebuilding
 action runtime images.
 
-  * `redo --dir /path/to/incubator-openwhisk-runtime-nodejs runtime:nodejs6action`
+  * `redo --dir /path/to/openwhisk-runtime-nodejs runtime:nodejs6action`
 
 ## How to use `citool`
 
@@ -63,7 +64,7 @@ To change the Travis (or Jenkins) host URL, use `-u`.
 - monitor a Travis CI build with job number `N`: `citool monitor N`
 - monitor same job `N` until completion: `citool monitor -p N`
 - save job output to a file: `citool -o monitor N`
-- for Travis CI matrix builds, use the matrix index after the job number as in `citool monitor N.i` where 1 <= i <= matrix buidls.
+- for Travis CI matrix builds, use the matrix index after the job number as in `citool monitor N.i` where 1 <= i <= matrix builds.
 
 To monitor a Jenkins build `B` with job number `N` on host `https://jenkins.host:port`:
 ```
@@ -94,8 +95,8 @@ citool -i -b B cat -s -g "tid_124" whisk/logs N
 
 ## Gradle Build Scan Integration
 
-OpenWhisk builds on CI setups have [Gradle Build Scan](https://gradle.com/build-scans) integrated. Each build on travis pushes scan reports to
-[Gradle Scan Community Hosted Server](https://scans.gradle.com). To see the scan report you need to check the travis build logs for lines like
+OpenWhisk builds on CI setups have [Gradle Build Scan](https://gradle.com/build-scans) integrated. Each build on Travis pushes scan reports to
+[Gradle Scan Community Hosted Server](https://scans.gradle.com). To see the scan report you need to check the Travis build logs for lines like
 below
 
 ```

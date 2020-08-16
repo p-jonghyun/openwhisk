@@ -96,12 +96,16 @@ class ShardingContainerPoolBalancerTests
     IndexedSeq.fill(count)(new NestedSemaphore[FullyQualifiedEntityName](max))
 
   def lbConfig(blackboxFraction: Double, managedFraction: Option[Double] = None) =
-    ShardingContainerPoolBalancerConfig(managedFraction.getOrElse(1.0 - blackboxFraction), blackboxFraction, 1)
+    ShardingContainerPoolBalancerConfig(
+      managedFraction.getOrElse(1.0 - blackboxFraction),
+      blackboxFraction,
+      1,
+      1.minute)
 
   it should "update invoker's state, growing the slots data and keeping valid old data" in {
     // start empty
     val slots = 10
-    val memoryPerSlot = MemoryLimit.minMemory
+    val memoryPerSlot = MemoryLimit.MIN_MEMORY
     val memory = memoryPerSlot * slots
     val state = ShardingContainerPoolBalancerState()(lbConfig(0.5))
     state.invokers shouldBe 'empty
@@ -148,7 +152,7 @@ class ShardingContainerPoolBalancerTests
       val state = ShardingContainerPoolBalancerState()(lbConfig(bf))
 
       (1 to 100).toSeq.foreach { i =>
-        state.updateInvokers((1 to i).map(_ => healthy(1, MemoryLimit.stdMemory)))
+        state.updateInvokers((1 to i).map(_ => healthy(1, MemoryLimit.STD_MEMORY)))
 
         withClue(s"invoker count $bf $i:") {
           state.managedInvokers.length should be <= i
@@ -174,7 +178,7 @@ class ShardingContainerPoolBalancerTests
 
     val state = ShardingContainerPoolBalancerState()(lbConfig(1.0, Some(1.0)))
     (1 to 100).foreach { i =>
-      state.updateInvokers((1 to i).map(_ => healthy(1, MemoryLimit.stdMemory)))
+      state.updateInvokers((1 to i).map(_ => healthy(1, MemoryLimit.STD_MEMORY)))
     }
 
     state.managedInvokers should have size 100
@@ -185,7 +189,7 @@ class ShardingContainerPoolBalancerTests
 
   it should "update the cluster size, adjusting the invoker slots accordingly" in {
     val slots = 10
-    val memoryPerSlot = MemoryLimit.minMemory
+    val memoryPerSlot = MemoryLimit.MIN_MEMORY
     val memory = memoryPerSlot * slots
     val state = ShardingContainerPoolBalancerState()(lbConfig(0.5))
     state.updateInvokers(IndexedSeq(healthy(0, memory), healthy(1, memory * 2)))
@@ -203,7 +207,7 @@ class ShardingContainerPoolBalancerTests
 
   it should "fallback to a size of 1 (alone) if cluster size is < 1" in {
     val slots = 10
-    val memoryPerSlot = MemoryLimit.minMemory
+    val memoryPerSlot = MemoryLimit.MIN_MEMORY
     val memory = memoryPerSlot * slots
     val state = ShardingContainerPoolBalancerState()(lbConfig(0.5))
     state.updateInvokers(IndexedSeq(healthy(0, memory)))
@@ -222,7 +226,7 @@ class ShardingContainerPoolBalancerTests
 
   it should "set the threshold to 1 if the cluster is bigger than there are slots on 1 invoker" in {
     val slots = 10
-    val memoryPerSlot = MemoryLimit.minMemory
+    val memoryPerSlot = MemoryLimit.MIN_MEMORY
     val memory = memoryPerSlot * slots
     val state = ShardingContainerPoolBalancerState()(lbConfig(0.5))
     state.updateInvokers(IndexedSeq(healthy(0, memory)))
@@ -231,7 +235,7 @@ class ShardingContainerPoolBalancerTests
 
     state.updateCluster(20)
 
-    state.invokerSlots.head.availablePermits shouldBe MemoryLimit.minMemory.toMB
+    state.invokerSlots.head.availablePermits shouldBe MemoryLimit.MIN_MEMORY.toMB
   }
   val namespace = EntityPath("testspace")
   val name = EntityName("testname")
@@ -247,7 +251,7 @@ class ShardingContainerPoolBalancerTests
       fqn,
       IndexedSeq.empty,
       IndexedSeq.empty,
-      MemoryLimit.minMemory.toMB.toInt,
+      MemoryLimit.MIN_MEMORY.toMB.toInt,
       index = 0,
       step = 2) shouldBe None
   }
@@ -262,7 +266,7 @@ class ShardingContainerPoolBalancerTests
       fqn,
       invokers,
       invokerSlots,
-      MemoryLimit.minMemory.toMB.toInt,
+      MemoryLimit.MIN_MEMORY.toMB.toInt,
       index = 0,
       step = 2) shouldBe None
   }
@@ -429,7 +433,7 @@ class ShardingContainerPoolBalancerTests
   // - no concurrency room and no memory room to launch new containers
   //(1 until maxActivations).foreach { i =>
   (75 until maxActivations).foreach { i =>
-    it should s"reflect concurrent processing ${i} state in containerSlots" in {
+    it should s"reflect concurrent processing $i state in containerSlots" in {
       //each batch will:
       // - submit activations concurrently
       // - wait for activation submission to messaging system (mostly to detect which invoker was assiged
@@ -459,6 +463,7 @@ class ShardingContainerPoolBalancerTests
 
     messaging
   }
+
   def testActivationBatch(numActivations: Int): Unit = {
     //setup mock messaging
     val feedProbe = new FeedFactory {
@@ -492,21 +497,18 @@ class ShardingContainerPoolBalancerTests
     val stepSize = stepSizes(hash % stepSizes.size)
     val uuid = UUID()
     //initiate activation
-    val published = (0 until numActivations).par.map { _ =>
+    val published = (0 until numActivations).map { _ =>
       val aid = ActivationId.generate()
       val msg = ActivationMessage(
         TransactionId.testing,
         actionMetaData.fullyQualifiedName(true),
         actionMetaData.rev,
-        Identity(
-          Subject(),
-          Namespace(invocationNamespace, uuid),
-          BasicAuthenticationAuthKey(uuid, Secret()),
-          Set.empty),
+        Identity(Subject(), Namespace(invocationNamespace, uuid), BasicAuthenticationAuthKey(uuid, Secret())),
         aid,
         ControllerInstanceId("0"),
         blocking = false,
-        content = None)
+        content = None,
+        initArgs = Set.empty)
 
       //send activation to loadbalancer
       aid -> balancer.publish(actionMetaData.toExecutableWhiskAction.get, msg)
@@ -543,12 +545,12 @@ class ShardingContainerPoolBalancerTests
     }
 
     //complete all
-    val acks = ids.par.map { aid =>
+    val acks = ids.map { aid =>
       val invoker = balancer.activationSlots(aid).invokerName
       completeActivation(invoker, balancer, aid)
     }
 
-    Await.ready(Future.sequence(acks.toList), 10.seconds)
+    Await.ready(Future.sequence(acks), 10.seconds)
 
     //verify invokers go back to unused state
     invokers.foreach { i =>
@@ -568,8 +570,8 @@ class ShardingContainerPoolBalancerTests
 
   def completeActivation(invoker: InvokerInstanceId, balancer: ShardingContainerPoolBalancer, aid: ActivationId) = {
     //complete activation
-    val ack = CompletionMessage(TransactionId.testing, aid, false, invoker).serialize
-      .getBytes(StandardCharsets.UTF_8)
+    val ack =
+      CompletionMessage(TransactionId.testing, aid, Some(false), invoker).serialize.getBytes(StandardCharsets.UTF_8)
     balancer.processAcknowledgement(ack)
   }
 }

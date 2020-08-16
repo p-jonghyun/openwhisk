@@ -124,7 +124,7 @@ object ActivationHandler extends SimpleHandler {
   private val fieldsForView = commonFields ++ Seq("end", "response.statusCode")
 
   protected val supportedTables =
-    Set("activations/byDate", "whisks-filters.v2.1.0/activations", "whisks.v2.1.0/activations")
+    Set("activations/byDate", "whisks-filters.v2.1.1/activations", "whisks.v2.1.0/activations")
 
   override def computedFields(js: JsObject): JsObject = {
     val path = js.fields.get("namespace") match {
@@ -156,7 +156,7 @@ object ActivationHandler extends SimpleHandler {
   }
 
   private def computeActivationView(js: JsObject): JsObject = {
-    val common = js.fields.filterKeys(commonFields)
+    val common = js.fields.filterKeys(commonFields).toMap
 
     val (endTime, duration) = js.getFields("end", "start") match {
       case Seq(JsNumber(end), JsNumber(start)) if end != 0 => (JsNumber(end), JsNumber(end - start))
@@ -263,19 +263,19 @@ object WhisksHandler extends SimpleHandler {
   }
 
   private def computeTriggersView(js: JsObject): JsObject = {
-    JsObject(js.fields.filterKeys(commonFields))
+    JsObject(js.fields.filterKeys(commonFields).toMap)
   }
 
   private def computePublicPackageView(js: JsObject): JsObject = {
-    JsObject(js.fields.filterKeys(commonFields) + ("binding" -> JsFalse))
+    JsObject(js.fields.filterKeys(commonFields).toMap + ("binding" -> JsFalse))
   }
 
   private def computeRulesView(js: JsObject) = {
-    JsObject(js.fields.filterKeys(ruleFields))
+    JsObject(js.fields.filterKeys(ruleFields).toMap)
   }
 
   private def computePackageView(js: JsObject): JsObject = {
-    val common = js.fields.filterKeys(commonFields)
+    val common = js.fields.filterKeys(commonFields).toMap
     val binding = js.fields.get("binding") match {
       case Some(x: JsObject) if x.fields.nonEmpty => x
       case _                                      => JsFalse
@@ -284,7 +284,7 @@ object WhisksHandler extends SimpleHandler {
   }
 
   private def computeActionView(js: JsObject): JsObject = {
-    val base = js.fields.filterKeys(commonFields ++ Set("limits"))
+    val base = js.fields.filterKeys(commonFields ++ Set("limits")).toMap
     val exec_binary = JsHelpers.getFieldPath(js, "exec", "binary")
     JsObject(base + ("exec" -> JsObject("binary" -> exec_binary.getOrElse(JsFalse))))
   }
@@ -292,11 +292,12 @@ object WhisksHandler extends SimpleHandler {
 
 object SubjectHandler extends DocumentHandler {
 
-  protected val supportedTables = Set("subjects/identities", "namespaceThrottlings/blockedNamespaces")
+  protected val supportedTables =
+    Set("subjects/identities", "subjects.v2.0.0/identities", "namespaceThrottlings/blockedNamespaces")
 
   override def shouldAlwaysIncludeDocs(ddoc: String, view: String): Boolean = {
     (ddoc, view) match {
-      case ("subjects", "identities")                    => true
+      case (s, "identities") if s.startsWith("subjects") => true
       case ("namespaceThrottlings", "blockedNamespaces") => true
       case _                                             => throw UnsupportedView(s"$ddoc/$view")
     }
@@ -312,7 +313,7 @@ object SubjectHandler extends DocumentHandler {
     provider: DocumentProvider)(implicit transid: TransactionId, ec: ExecutionContext): Future[Seq[JsObject]] = {
 
     val result = (ddoc, view) match {
-      case ("subjects", "identities") =>
+      case (s, "identities") if s.startsWith("subjects") =>
         require(includeDocs) //For subject/identities includeDocs is always true
         computeSubjectView(startKey, js, provider)
       case ("namespaceThrottlings", "blockedNamespaces") =>

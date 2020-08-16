@@ -237,6 +237,10 @@ Components = [
                   'recreate main db for entities',
                   yaml = 'wipe.yml'),
 
+    makeComponent('elasticsearch',
+                  'deploy elasticsearch',
+                  modes = 'clean'),
+
     makeComponent('build',
                   'build system',
                   yaml = False,
@@ -311,7 +315,13 @@ Components = [
                   'run units tests',
                   yaml = False,
                   tasks = 'testUnit',
-                  gradle = 'tests')
+                  gradle = 'tests'),
+
+    makeComponent('standalone',
+                  'run standalone server',
+                  yaml = False,
+                  tasks = 'bootRun',
+                  gradle = 'core:standalone')
 ]
 
 def getComponent(component):
