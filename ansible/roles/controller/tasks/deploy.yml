@@ -321,7 +321,7 @@
 - name: include plugins
   include_tasks: "{{ item }}.yml"
   with_items: "{{ controller_plugins | default([]) }}"
-  when: not lean
+#  when: not lean
 
 - name: lean controller setup
   include_tasks: "lean.yml"
@@ -332,6 +332,7 @@
     name: "{{ controller_name }}"
     image:
       "{{docker_registry~docker.image.prefix}}/controller:{{ 'cov' if (coverage_enabled) else docker.image.tag }}"
+    memory: '1g'
     state: started
     recreate: true
     restart_policy: "{{ docker.restart.policy }}"

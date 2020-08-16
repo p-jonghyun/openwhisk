@@ -66,8 +66,9 @@ whisk:
 #       {{ runtimes_local_image_prefix }} to skip docker pull in invoker even if the image is not part of the blackbox set
 #
 
-manifestfile: "{{ manifest_file | default('/ansible/files/runtimes.json') }}"
+manifestfile: "{{ manifest_file | default('/ansible/files/rpiruntimes.json') }}"
 runtimesManifest: "{{ runtimes_manifest | default(lookup('file', openwhisk_home ~ '{{ manifestfile }}') | from_json) }}"
+skip_pull_runtimes: "false"
 
 limits:
   invocationsPerMinute: "{{ limit_invocations_per_minute | default(60) }}"
@@ -85,7 +86,7 @@ controller:
     become: "{{ controller_dir_become | default(false) }}"
   confdir: "{{ config_root_dir }}/controller"
   basePort: 10001
-  heap: "{{ controller_heap | default('2g') }}"
+  heap: "{{ controller_heap | default('1g') }}"
   arguments: "{{ controller_arguments | default('') }}"
   managedFraction: "{{ controller_managed_fraction | default(1.0 - (controller_blackbox_fraction | default(__controller_blackbox_fraction))) }}"
   blackboxFraction: "{{ controller_blackbox_fraction | default(__controller_blackbox_fraction) }}"
@@ -93,7 +94,7 @@ controller:
   timeoutAddon: "{{ controller_timeout_addon | default('1 m') }}"
   instances: "{{ groups['controllers'] | length }}"
   akka:
-    provider: cluster
+    provider: local
     cluster:
       basePort: 8000
       host: "{{ groups['controllers'] | map('extract', hostvars, 'ansible_host') | list }}"
@@ -310,7 +311,9 @@ linux:
   version: 4.4.0-31
 
 couchdb:
-  version: 2.3
+  docker_image: treehouses/couchdb
+  version: 2.1.0
+  pull_couchdb: true
 
 elasticsearch:
   version: 6.7.2

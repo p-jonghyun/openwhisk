@@ -1,3 +1,4 @@
+#!/bin/bash
 #
 # Licensed to the Apache Software Foundation (ASF) under one or more
 # contributor license agreements.  See the NOTICE file distributed with
@@ -14,17 +15,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
----
-# Install the appropriate CLI into the ansible host
 
-- name: grab the local CLI from the binaries unarchived into nginx
-  get_url:
-    url: "https://{{host}}/cli/go/download/{{os}}/{{arch}}/{{wsk}}"
-    dest: "{{ openwhisk_home }}/bin"
-    mode: "0755"
-    validate_certs: no
-  vars:
-    host: "{{ groups['edge'] | first }}"
-    arch: "{{ ansible_machine | replace ('x86_64', 'amd64') | replace ('armv7l', 'arm') }}"
-    os: "{{ ansible_system | lower | replace('darwin', 'mac') }}"
-    wsk: "{{ ( ansible_system == 'Windows') | ternary('wsk.exe', 'wsk') }}"
+if [[ $( ls /conf/jmxremote.* 2> /dev/null ) ]]
+then
+  mv /conf/jmxremote.* /home/owuser
+  chmod 600 /home/owuser/jmxremote.*
+fi

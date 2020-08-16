@@ -338,7 +338,7 @@
 - name: define options when deploying invoker on Ubuntu
   set_fact:
     volumes: "{{ volumes|default('') }},/usr/lib/x86_64-linux-gnu/libapparmor.so.1:/usr/lib/x86_64-linux-gnu/libapparmor.so.1"
-  when: ansible_distribution == "Ubuntu"
+  when: ansible_distribution == "Ubuntu" or ansible_distribution == "Debian"
 
 - name: check if coverage collection is enabled
   set_fact:

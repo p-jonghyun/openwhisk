@@ -83,8 +83,8 @@
     url: "{{ db.protocol }}://{{ ansible_host }}:{{ db.port }}/_utils/"
   register: result
   until: result.status == 200
-  retries: 12
-  delay: 5
+  retries: 24
+  delay: 10
 
 - name: check if '_users' database exists
   uri:
