@@ -35,7 +35,8 @@ import akka.http.scaladsl.unmarshalling.{Unmarshal, Unmarshaller}
 import akka.stream.ActorMaterializer
 import spray.json.DefaultJsonProtocol._
 import com.typesafe.sslconfig.akka.AkkaSSLConfig
-import pureconfig.loadConfigOrThrow
+import pureconfig._
+import pureconfig.generic.auto._
 import spray.json._
 import org.apache.openwhisk.common.Https.HttpsConfig
 import org.apache.openwhisk.common.{Https, TransactionId}
@@ -168,7 +169,7 @@ trait WhiskTriggersApi extends WhiskCollectionAPI {
                     triggerActivation
                 }
                 .map { activation =>
-                  activationStore.storeAfterCheck(activation, context)
+                  activationStore.storeAfterCheck(activation, false, None, context)
                 }
 
               respondWithActivationIdHeader(triggerActivationId) {

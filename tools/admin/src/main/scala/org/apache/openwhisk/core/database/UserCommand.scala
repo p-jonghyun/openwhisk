@@ -22,17 +22,18 @@ import java.util.UUID
 import akka.actor.ActorSystem
 import akka.stream.ActorMaterializer
 import akka.stream.scaladsl.{Sink, Source}
-import org.rogach.scallop.{ScallopConfBase, Subcommand}
-import spray.json.{JsBoolean, JsObject, JsString, JsValue, RootJsonFormat}
 import org.apache.openwhisk.common.{Logging, TransactionId}
 import org.apache.openwhisk.core.cli.{CommandError, CommandMessages, IllegalState, WhiskCommand}
 import org.apache.openwhisk.core.database.UserCommand.ExtendedAuth
-import org.apache.openwhisk.core.entity.types._
 import org.apache.openwhisk.core.entity._
+import org.apache.openwhisk.core.entity.types._
 import org.apache.openwhisk.http.Messages
 import org.apache.openwhisk.spi.SpiLoader
+import org.rogach.scallop.{ScallopConfBase, Subcommand}
+import spray.json.{JsBoolean, JsObject, JsString, JsValue, RootJsonFormat}
 
 import scala.concurrent.{ExecutionContext, Future}
+import scala.language.reflectiveCalls
 import scala.reflect.classTag
 import scala.util.{Properties, Try}
 
@@ -58,7 +59,7 @@ class UserCommand extends Subcommand("user") with WhiskCommand {
       if (s.length < 5) {
         Left(CommandMessages.shortName)
       } else {
-        Right(Unit)
+        Right(())
       }
     }
 
@@ -70,7 +71,7 @@ class UserCommand extends Subcommand("user") with WhiskCommand {
           } else if (!isUUID(uuid)) {
             Left(CommandMessages.invalidUUID)
           } else {
-            Right(Unit)
+            Right(())
           }
         case _ => Left(s"failed to determine authorization id and key: $a")
       }

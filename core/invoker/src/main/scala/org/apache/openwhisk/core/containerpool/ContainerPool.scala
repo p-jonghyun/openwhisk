@@ -18,10 +18,13 @@
 package org.apache.openwhisk.core.containerpool
 
 import akka.actor.{Actor, ActorRef, ActorRefFactory, Props}
-import org.apache.openwhisk.common.{AkkaLogging, LoggingMarkers, TransactionId}
+import org.apache.openwhisk.common.{Logging, LoggingMarkers, MetricEmitter, TransactionId}
 import org.apache.openwhisk.core.connector.MessageFeed
+import org.apache.openwhisk.core.entity.ExecManifest.ReactivePrewarmingConfig
 import org.apache.openwhisk.core.entity._
 import org.apache.openwhisk.core.entity.size._
+
+import scala.annotation.tailrec
 import scala.collection.immutable
 import scala.concurrent.duration._
 import scala.util.Try
@@ -30,7 +33,13 @@ sealed trait WorkerState
 case object Busy extends WorkerState
 case object Free extends WorkerState
 
+case class ColdStartKey(kind: String, memory: ByteSize)
+
 case class WorkerData(data: ContainerData, state: WorkerState)
+
+case object EmitMetrics
+
+case object AdjustPrewarmedContainer
 
 /**
  * A pool managing containers to run actions on.
@@ -55,28 +64,37 @@ case class WorkerData(data: ContainerData, state: WorkerState)
 class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                     feed: ActorRef,
                     prewarmConfig: List[PrewarmingConfig] = List.empty,
-                    poolConfig: ContainerPoolConfig)
+                    poolConfig: ContainerPoolConfig)(implicit val logging: Logging)
     extends Actor {
   import ContainerPool.memoryConsumptionOf
 
-  implicit val logging = new AkkaLogging(context.system.log)
+  implicit val ec = context.dispatcher
 
   var freePool = immutable.Map.empty[ActorRef, ContainerData]
   var busyPool = immutable.Map.empty[ActorRef, ContainerData]
-  var prewarmedPool = immutable.Map.empty[ActorRef, ContainerData]
+  var prewarmedPool = immutable.Map.empty[ActorRef, PreWarmedData]
+  var prewarmStartingPool = immutable.Map.empty[ActorRef, (String, ByteSize)]
   // If all memory slots are occupied and if there is currently no container to be removed, than the actions will be
   // buffered here to keep order of computation.
   // Otherwise actions with small memory-limits could block actions with large memory limits.
   var runBuffer = immutable.Queue.empty[Run]
+  // Track the resent buffer head - so that we don't resend buffer head multiple times
+  var resent: Option[Run] = None
   val logMessageInterval = 10.seconds
+  //periodically emit metrics (don't need to do this for each message!)
+  context.system.scheduler.schedule(30.seconds, 10.seconds, self, EmitMetrics)
 
-  prewarmConfig.foreach { config =>
-    logging.info(this, s"pre-warming ${config.count} ${config.exec.kind} ${config.memoryLimit.toString}")(
-      TransactionId.invokerWarmup)
-    (1 to config.count).foreach { _ =>
-      prewarmContainer(config.exec, config.memoryLimit)
-    }
-  }
+  // Key is ColdStartKey, value is the number of cold Start in minute
+  var coldStartCount = immutable.Map.empty[ColdStartKey, Int]
+
+  adjustPrewarmedContainer(true, false)
+
+  // check periodically, adjust prewarmed container(delete if unused for some time and create some increment containers)
+  context.system.scheduler.schedule(
+    2.seconds,
+    poolConfig.prewarmExpirationCheckInterval,
+    self,
+    AdjustPrewarmedContainer)
 
   def logContainerStart(r: Run, containerState: String, activeActivations: Int, container: Option[Container]): Unit = {
     val namespaceName = r.msg.user.namespace.name
@@ -86,7 +104,11 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
 
     r.msg.transid.mark(
       this,
-      LoggingMarkers.INVOKER_CONTAINER_START(containerState),
+      LoggingMarkers.INVOKER_CONTAINER_START(
+        containerState,
+        r.msg.user.namespace.toString,
+        r.msg.action.namespace.toString,
+        r.msg.action.name.toString),
       s"containerStart containerState: $containerState container: $container activations: $activeActivations of max $maxConcurrent action: $actionName namespace: $namespaceName activationId: $activationId",
       akka.event.Logging.InfoLevel)
   }
@@ -105,6 +127,10 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
       // next request to process
       // It is guaranteed, that only the first message on the buffer is resent.
       if (runBuffer.isEmpty || isResentFromBuffer) {
+        if (isResentFromBuffer) {
+          //remove from resent tracking - it may get resent again, or get processed
+          resent = None
+        }
         val createdContainer =
           // Is there enough space on the invoker for this action to be executed.
           if (hasPoolSpaceFor(busyPool, r.action.limits.memory.megabytes.MB)) {
@@ -119,7 +145,11 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                 if (hasPoolSpaceFor(busyPool ++ freePool, r.action.limits.memory.megabytes.MB)) {
                   takePrewarmContainer(r.action)
                     .map(container => (container, "prewarmed"))
-                    .orElse(Some(createContainer(r.action.limits.memory.megabytes.MB), "cold"))
+                    .orElse {
+                      val container = Some(createContainer(r.action.limits.memory.megabytes.MB), "cold")
+                      incrementColdStartCount(r.action.exec.kind, r.action.limits.memory.megabytes.MB)
+                      container
+                    }
                 } else None)
               .orElse(
                 // Remove a container and create a new one for the given job
@@ -133,7 +163,11 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                   .map(_ =>
                     takePrewarmContainer(r.action)
                       .map(container => (container, "recreatedPrewarm"))
-                      .getOrElse(createContainer(r.action.limits.memory.megabytes.MB), "recreated")))
+                      .getOrElse {
+                        val container = (createContainer(r.action.limits.memory.megabytes.MB), "recreated")
+                        incrementColdStartCount(r.action.exec.kind, r.action.limits.memory.megabytes.MB)
+                        container
+                    }))
 
           } else None
 
@@ -160,13 +194,14 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
               //update freePool to track counts
               freePool = freePool + (actor -> newData)
             }
-            // Remove the action that get's executed now from the buffer and execute the next one afterwards.
+            // Remove the action that was just executed from the buffer and execute the next one in the queue.
             if (isResentFromBuffer) {
               // It is guaranteed that the currently executed messages is the head of the queue, if the message comes
               // from the buffer
               val (_, newBuffer) = runBuffer.dequeue
               runBuffer = newBuffer
-              runBuffer.dequeueOption.foreach { case (run, _) => self ! run }
+              // Try to process the next item in buffer (or get another message from feed, if buffer is now empty)
+              processBufferOrFeed()
             }
             actor ! r // forwards the run request to the container
             logContainerStart(r, containerState, newData.activeActivationCount, container)
@@ -176,7 +211,7 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
             // (and a new container would over commit the pool)
             val isErrorLogged = r.retryLogDeadline.map(_.isOverdue).getOrElse(true)
             val retryLogDeadline = if (isErrorLogged) {
-              logging.error(
+              logging.warn(
                 this,
                 s"Rescheduling Run message, too many message in the pool, " +
                   s"freePoolSize: ${freePool.size} containers and ${memoryConsumptionOf(freePool)} MB, " +
@@ -185,16 +220,16 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
                   s"userNamespace: ${r.msg.user.namespace.name}, action: ${r.action}, " +
                   s"needed memory: ${r.action.limits.memory.megabytes} MB, " +
                   s"waiting messages: ${runBuffer.size}")(r.msg.transid)
+              MetricEmitter.emitCounterMetric(LoggingMarkers.CONTAINER_POOL_RESCHEDULED_ACTIVATION)
               Some(logMessageInterval.fromNow)
             } else {
               r.retryLogDeadline
             }
             if (!isResentFromBuffer) {
               // Add this request to the buffer, as it is not there yet.
-              runBuffer = runBuffer.enqueue(r)
+              runBuffer = runBuffer.enqueue(Run(r.action, r.msg, retryLogDeadline))
             }
-            // As this request is the first one in the buffer, try again to execute it.
-            self ! Run(r.action, r.msg, retryLogDeadline)
+          //buffered items will be processed via processBufferOrFeed()
         }
       } else {
         // There are currently actions waiting to be executed before this action gets executed.
@@ -204,9 +239,9 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
 
     // Container is free to take more work
     case NeedWork(warmData: WarmedData) =>
-      feed ! MessageFeed.Processed
       val oldData = freePool.get(sender()).getOrElse(busyPool(sender()))
-      val newData = warmData.copy(activeActivationCount = oldData.activeActivationCount - 1)
+      val newData =
+        warmData.copy(lastUsed = oldData.lastUsed, activeActivationCount = oldData.activeActivationCount - 1)
       if (newData.activeActivationCount < 0) {
         logging.error(this, s"invalid activation count after warming < 1 ${newData}")
       }
@@ -225,25 +260,38 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
         busyPool = busyPool + (sender() -> newData)
         freePool = freePool - sender()
       }
-
+      processBufferOrFeed()
     // Container is prewarmed and ready to take work
     case NeedWork(data: PreWarmedData) =>
+      prewarmStartingPool = prewarmStartingPool - sender()
       prewarmedPool = prewarmedPool + (sender() -> data)
 
     // Container got removed
-    case ContainerRemoved =>
+    case ContainerRemoved(replacePrewarm) =>
       // if container was in free pool, it may have been processing (but under capacity),
       // so there is capacity to accept another job request
       freePool.get(sender()).foreach { f =>
         freePool = freePool - sender()
-        if (f.activeActivationCount > 0) {
-          feed ! MessageFeed.Processed
-        }
       }
       // container was busy (busy indicates at full capacity), so there is capacity to accept another job request
       busyPool.get(sender()).foreach { _ =>
         busyPool = busyPool - sender()
-        feed ! MessageFeed.Processed
+      }
+      processBufferOrFeed()
+
+      //in case this was a prewarm
+      prewarmedPool.get(sender()).foreach { data =>
+        prewarmedPool = prewarmedPool - sender()
+      }
+      //in case this was a starting prewarm
+      prewarmStartingPool.get(sender()).foreach { _ =>
+        logging.info(this, "failed starting prewarm removed")
+        prewarmStartingPool = prewarmStartingPool - sender()
+      }
+
+      //backfill prewarms on every ContainerRemoved(replacePrewarm = true), just in case
+      if (replacePrewarm) {
+        adjustPrewarmedContainer(false, false) //in case a prewarm is removed due to health failure or crash
       }
 
     // This message is received for one of these reasons:
@@ -254,6 +302,59 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
     case RescheduleJob =>
       freePool = freePool - sender()
       busyPool = busyPool - sender()
+    case EmitMetrics =>
+      emitMetrics()
+
+    case AdjustPrewarmedContainer =>
+      adjustPrewarmedContainer(false, true)
+  }
+
+  /** Resend next item in the buffer, or trigger next item in the feed, if no items in the buffer. */
+  def processBufferOrFeed() = {
+    // If buffer has more items, and head has not already been resent, send next one, otherwise get next from feed.
+    runBuffer.dequeueOption match {
+      case Some((run, _)) => //run the first from buffer
+        implicit val tid = run.msg.transid
+        //avoid sending dupes
+        if (resent.isEmpty) {
+          logging.info(this, s"re-processing from buffer (${runBuffer.length} items in buffer)")
+          resent = Some(run)
+          self ! run
+        } else {
+          //do not resend the buffer head multiple times (may reach this point from multiple messages, before the buffer head is re-processed)
+        }
+      case None => //feed me!
+        feed ! MessageFeed.Processed
+    }
+  }
+
+  /** adjust prewarm containers up to the configured requirements for each kind/memory combination. */
+  def adjustPrewarmedContainer(init: Boolean, scheduled: Boolean): Unit = {
+    //fill in missing prewarms
+    ContainerPool
+      .increasePrewarms(init, scheduled, coldStartCount, prewarmConfig, prewarmedPool, prewarmStartingPool)
+      .foreach { c =>
+        val config = c._1
+        val currentCount = c._2._1
+        val desiredCount = c._2._2
+        if (currentCount < desiredCount) {
+          (currentCount until desiredCount).foreach { _ =>
+            prewarmContainer(config.exec, config.memoryLimit, config.reactive.map(_.ttl))
+          }
+        }
+      }
+    if (scheduled) {
+      //on scheduled time, remove expired prewarms
+      ContainerPool.removeExpired(prewarmConfig, prewarmedPool).foreach(_ ! Remove)
+      //on scheduled time, emit cold start counter metric with memory + kind
+      coldStartCount foreach { coldStart =>
+        val coldStartKey = coldStart._1
+        MetricEmitter.emitCounterMetric(
+          LoggingMarkers.CONTAINER_POOL_PREWARM_COLDSTART(coldStartKey.memory.toString, coldStartKey.kind))
+      }
+      //   then clear coldStartCounts each time scheduled event is processed to reset counts
+      coldStartCount = immutable.Map.empty[ColdStartKey, Int]
+    }
   }
 
   /** Creates a new container and updates state accordingly. */
@@ -265,8 +366,26 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
   }
 
   /** Creates a new prewarmed container */
-  def prewarmContainer(exec: CodeExec[_], memoryLimit: ByteSize): Unit =
-    childFactory(context) ! Start(exec, memoryLimit)
+  def prewarmContainer(exec: CodeExec[_], memoryLimit: ByteSize, ttl: Option[FiniteDuration]): Unit = {
+    val newContainer = childFactory(context)
+    prewarmStartingPool = prewarmStartingPool + (newContainer -> (exec.kind, memoryLimit))
+    newContainer ! Start(exec, memoryLimit, ttl)
+  }
+
+  /** this is only for cold start statistics of prewarm configs, e.g. not blackbox or other configs. */
+  def incrementColdStartCount(kind: String, memoryLimit: ByteSize): Unit = {
+    prewarmConfig
+      .filter { config =>
+        kind == config.exec.kind && memoryLimit == config.memoryLimit
+      }
+      .foreach { _ =>
+        val coldStartKey = ColdStartKey(kind, memoryLimit)
+        coldStartCount.get(coldStartKey) match {
+          case Some(value) => coldStartCount = coldStartCount + (coldStartKey -> (value + 1))
+          case None        => coldStartCount = coldStartCount + (coldStartKey -> 1)
+        }
+      }
+  }
 
   /**
    * Takes a prewarm container out of the prewarmed pool
@@ -278,10 +397,12 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
   def takePrewarmContainer(action: ExecutableWhiskAction): Option[(ActorRef, ContainerData)] = {
     val kind = action.exec.kind
     val memory = action.limits.memory.megabytes.MB
-    prewarmedPool
+    val now = Deadline.now
+    prewarmedPool.toSeq
+      .sortBy(_._2.expires.getOrElse(now))
       .find {
-        case (_, PreWarmedData(_, `kind`, `memory`, _)) => true
-        case _                                          => false
+        case (_, PreWarmedData(_, `kind`, `memory`, _, _)) => true
+        case _                                             => false
       }
       .map {
         case (ref, data) =>
@@ -291,7 +412,11 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
           // Create a new prewarm container
           // NOTE: prewarming ignores the action code in exec, but this is dangerous as the field is accessible to the
           // factory
-          prewarmContainer(action.exec, memory)
+
+          //get the appropriate ttl from prewarm configs
+          val ttl =
+            prewarmConfig.find(pc => pc.memoryLimit == memory && pc.exec.kind == kind).flatMap(_.reactive.map(_.ttl))
+          prewarmContainer(action.exec, memory, ttl)
           (ref, data)
       }
   }
@@ -312,6 +437,29 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
    */
   def hasPoolSpaceFor[A](pool: Map[A, ContainerData], memory: ByteSize): Boolean = {
     memoryConsumptionOf(pool) + memory.toMB <= poolConfig.userMemory.toMB
+  }
+
+  /**
+   * Log metrics about pool state (buffer size, buffer memory requirements, active number, active memory, prewarm number, prewarm memory)
+   */
+  private def emitMetrics() = {
+    MetricEmitter.emitGaugeMetric(LoggingMarkers.CONTAINER_POOL_RUNBUFFER_COUNT, runBuffer.size)
+    MetricEmitter.emitGaugeMetric(
+      LoggingMarkers.CONTAINER_POOL_RUNBUFFER_SIZE,
+      runBuffer.map(_.action.limits.memory.megabytes).sum)
+    val containersInUse = freePool.filter(_._2.activeActivationCount > 0) ++ busyPool
+    MetricEmitter.emitGaugeMetric(LoggingMarkers.CONTAINER_POOL_ACTIVE_COUNT, containersInUse.size)
+    MetricEmitter.emitGaugeMetric(
+      LoggingMarkers.CONTAINER_POOL_ACTIVE_SIZE,
+      containersInUse.map(_._2.memoryLimit.toMB).sum)
+    MetricEmitter.emitGaugeMetric(LoggingMarkers.CONTAINER_POOL_PREWARM_COUNT, prewarmedPool.size)
+    MetricEmitter.emitGaugeMetric(
+      LoggingMarkers.CONTAINER_POOL_PREWARM_SIZE,
+      prewarmedPool.map(_._2.memoryLimit.toMB).sum)
+    val unused = freePool.filter(_._2.activeActivationCount == 0)
+    val unusedMB = unused.map(_._2.memoryLimit.toMB).sum
+    MetricEmitter.emitGaugeMetric(LoggingMarkers.CONTAINER_POOL_IDLES_COUNT, unused.size)
+    MetricEmitter.emitGaugeMetric(LoggingMarkers.CONTAINER_POOL_IDLES_SIZE, unusedMB)
   }
 }
 
@@ -347,8 +495,8 @@ object ContainerPool {
                                            idles: Map[A, ContainerData]): Option[(A, ContainerData)] = {
     idles
       .find {
-        case (_, c @ WarmedData(_, `invocationNamespace`, `action`, _, _)) if c.hasCapacity() => true
-        case _                                                                                => false
+        case (_, c @ WarmedData(_, `invocationNamespace`, `action`, _, _, _)) if c.hasCapacity() => true
+        case _                                                                                   => false
       }
       .orElse {
         idles.find {
@@ -375,7 +523,10 @@ object ContainerPool {
    * @param memory the amount of memory that has to be freed up
    * @return a list of containers to be removed iff found
    */
-  protected[containerpool] def remove[A](pool: Map[A, ContainerData], memory: ByteSize): List[A] = {
+  @tailrec
+  protected[containerpool] def remove[A](pool: Map[A, ContainerData],
+                                         memory: ByteSize,
+                                         toRemove: List[A] = List.empty): List[A] = {
     // Try to find a Free container that does NOT have any active activations AND is initialized with any OTHER action
     val freeContainers = pool.collect {
       // Only warm containers will be removed. Prewarmed containers will stay always.
@@ -391,22 +542,134 @@ object ContainerPool {
       val (ref, data) = freeContainers.minBy(_._2.lastUsed)
       // Catch exception if remaining memory will be negative
       val remainingMemory = Try(memory - data.memoryLimit).getOrElse(0.B)
-      List(ref) ++ remove(freeContainers - ref, remainingMemory)
+      remove(freeContainers - ref, remainingMemory, toRemove ++ List(ref))
     } else {
       // If this is the first call: All containers are in use currently, or there is more memory needed than
       // containers can be removed.
       // Or, if this is one of the recursions: Enough containers are found to get the memory, that is
       // necessary. -> Abort recursion
-      List.empty
+      toRemove
+    }
+  }
+
+  /**
+   * Find the expired actor in prewarmedPool
+   *
+   * @param prewarmConfig
+   * @param prewarmedPool
+   * @param logging
+   * @return a list of expired actor
+   */
+  def removeExpired(prewarmConfig: List[PrewarmingConfig], prewarmedPool: Map[ActorRef, PreWarmedData])(
+    implicit logging: Logging): List[ActorRef] = {
+    prewarmConfig.flatMap { config =>
+      val kind = config.exec.kind
+      val memory = config.memoryLimit
+      config.reactive
+        .map { _ =>
+          val expiredPrewarmedContainer = prewarmedPool
+            .filter { warmInfo =>
+              warmInfo match {
+                case (_, p @ PreWarmedData(_, `kind`, `memory`, _, _)) if p.isExpired() => true
+                case _                                                                  => false
+              }
+            }
+          // emit expired container counter metric with memory + kind
+          MetricEmitter.emitCounterMetric(LoggingMarkers.CONTAINER_POOL_PREWARM_EXPIRED(memory.toString, kind))
+          logging.info(
+            this,
+            s"[kind: ${kind} memory: ${memory.toString}] removed ${expiredPrewarmedContainer.size} expired prewarmed container")
+          expiredPrewarmedContainer.keys
+        }
+        .getOrElse(List.empty)
+    }
+  }
+
+  /**
+   * Find the increased number for the prewarmed kind
+   *
+   * @param init
+   * @param scheduled
+   * @param coldStartCount
+   * @param prewarmConfig
+   * @param prewarmedPool
+   * @param prewarmStartingPool
+   * @param logging
+   * @return the current number and increased number for the kind in the Map
+   */
+  def increasePrewarms(init: Boolean,
+                       scheduled: Boolean,
+                       coldStartCount: Map[ColdStartKey, Int],
+                       prewarmConfig: List[PrewarmingConfig],
+                       prewarmedPool: Map[ActorRef, PreWarmedData],
+                       prewarmStartingPool: Map[ActorRef, (String, ByteSize)])(
+    implicit logging: Logging): Map[PrewarmingConfig, (Int, Int)] = {
+    prewarmConfig.map { config =>
+      val kind = config.exec.kind
+      val memory = config.memoryLimit
+
+      val runningCount = prewarmedPool.count {
+        // done starting, and not expired
+        case (_, p @ PreWarmedData(_, `kind`, `memory`, _, _)) if !p.isExpired() => true
+        // started but not finished starting (or expired)
+        case _ => false
+      }
+      val startingCount = prewarmStartingPool.count(p => p._2._1 == kind && p._2._2 == memory)
+      val currentCount = runningCount + startingCount
+
+      // determine how many are needed
+      val desiredCount: Int =
+        if (init) config.initialCount
+        else {
+          if (scheduled) {
+            // scheduled/reactive config backfill
+            config.reactive
+              .map(c => getReactiveCold(coldStartCount, c, kind, memory).getOrElse(c.minCount)) //reactive -> desired is either cold start driven, or minCount
+              .getOrElse(config.initialCount) //not reactive -> desired is always initial count
+          } else {
+            // normal backfill after removal - make sure at least minCount or initialCount is started
+            config.reactive.map(_.minCount).getOrElse(config.initialCount)
+          }
+        }
+
+      logging.info(
+        this,
+        s"found ${currentCount} started and ${startingCount} starting; ${if (init) "initing" else "backfilling"} ${desiredCount - currentCount} pre-warms to desired count: ${desiredCount} for kind:${config.exec.kind} mem:${config.memoryLimit.toString}")(
+        TransactionId.invokerWarmup)
+      (config, (currentCount, desiredCount))
+    }.toMap
+  }
+
+  /**
+   * Get the required prewarmed container number according to the cold start happened in previous minute
+   *
+   * @param coldStartCount
+   * @param config
+   * @param kind
+   * @param memory
+   * @return the required prewarmed container number
+   */
+  def getReactiveCold(coldStartCount: Map[ColdStartKey, Int],
+                      config: ReactivePrewarmingConfig,
+                      kind: String,
+                      memory: ByteSize): Option[Int] = {
+    coldStartCount.get(ColdStartKey(kind, memory)).map { value =>
+      // Let's assume that threshold is `2`, increment is `1` in runtimes.json
+      // if cold start number in previous minute is `2`, requireCount is `2/2 * 1 = 1`
+      // if cold start number in previous minute is `4`, requireCount is `4/2 * 1 = 2`
+      math.min(math.max(config.minCount, (value / config.threshold) * config.increment), config.maxCount)
     }
   }
 
   def props(factory: ActorRefFactory => ActorRef,
             poolConfig: ContainerPoolConfig,
             feed: ActorRef,
-            prewarmConfig: List[PrewarmingConfig] = List.empty) =
+            prewarmConfig: List[PrewarmingConfig] = List.empty)(implicit logging: Logging) =
     Props(new ContainerPool(factory, feed, prewarmConfig, poolConfig))
 }
 
 /** Contains settings needed to perform container prewarming. */
-case class PrewarmingConfig(count: Int, exec: CodeExec[_], memoryLimit: ByteSize)
+case class PrewarmingConfig(initialCount: Int,
+                            exec: CodeExec[_],
+                            memoryLimit: ByteSize,
+                            reactive: Option[ReactivePrewarmingConfig] = None)

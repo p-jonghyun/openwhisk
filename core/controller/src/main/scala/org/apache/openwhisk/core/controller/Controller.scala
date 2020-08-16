@@ -21,15 +21,17 @@ import akka.Done
 import akka.actor.{ActorSystem, CoordinatedShutdown}
 import akka.event.Logging.InfoLevel
 import akka.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
+import akka.http.scaladsl.model.StatusCodes._
 import akka.http.scaladsl.model.Uri
 import akka.http.scaladsl.server.Route
 import akka.stream.ActorMaterializer
 import kamon.Kamon
-import pureconfig.loadConfigOrThrow
+import pureconfig._
+import pureconfig.generic.auto._
 import spray.json.DefaultJsonProtocol._
 import spray.json._
 import org.apache.openwhisk.common.Https.HttpsConfig
-import org.apache.openwhisk.common.{AkkaLogging, Logging, LoggingMarkers, TransactionId}
+import org.apache.openwhisk.common.{AkkaLogging, ConfigMXBean, Logging, LoggingMarkers, TransactionId}
 import org.apache.openwhisk.core.WhiskConfig
 import org.apache.openwhisk.core.connector.MessagingProvider
 import org.apache.openwhisk.core.containerpool.logging.LogStoreProvider
@@ -130,12 +132,14 @@ class Controller(val instance: ControllerInstanceId,
   private val swagger = new SwaggerDocs(Uri.Path.Empty, "infoswagger.json")
 
   /**
-   * Handles GET /invokers
-   *             /invokers/healthy/count
+   * Handles GET /invokers - list of invokers
+   *             /invokers/healthy/count - nr of healthy invokers
+   *             /invokers/ready - 200 in case # of healthy invokers are above the expected value
+   *                             - 500 in case # of healthy invokers are bellow the expected value
    *
    * @return JSON with details of invoker health or count of healthy invokers respectively.
    */
-  private val internalInvokerHealth = {
+  protected[controller] val internalInvokerHealth = {
     implicit val executionContext = actorSystem.dispatcher
     (pathPrefix("invokers") & get) {
       pathEndOrSingleSlash {
@@ -149,6 +153,16 @@ class Controller(val instance: ControllerInstanceId,
           loadBalancer
             .invokerHealth()
             .map(_.count(_.status == InvokerState.Healthy).toJson)
+        }
+      } ~ path("ready") {
+        onSuccess(loadBalancer.invokerHealth()) { invokersHealth =>
+          val all = invokersHealth.size
+          val healthy = invokersHealth.count(_.status == InvokerState.Healthy)
+          val ready = Controller.readyState(all, healthy, Controller.readinessThreshold.getOrElse(1))
+          if (ready)
+            complete(JsObject("healthy" -> s"$healthy/$all".toJson))
+          else
+            complete(InternalServerError -> JsObject("unhealthy" -> s"${all - healthy}/$all".toJson))
         }
       }
     }
@@ -170,13 +184,14 @@ class Controller(val instance: ControllerInstanceId,
 object Controller {
 
   protected val protocol = loadConfigOrThrow[String]("whisk.controller.protocol")
+  protected val interface = loadConfigOrThrow[String]("whisk.controller.interface")
+  protected val readinessThreshold = loadConfig[Double]("whisk.controller.readiness-fraction")
 
   // requiredProperties is a Map whose keys define properties that must be bound to
   // a value, and whose values are default values.   A null value in the Map means there is
   // no default value specified, so it must appear in the properties file
   def requiredProperties =
-    Map(WhiskConfig.controllerInstances -> null) ++
-      ExecManifest.requiredProperties ++
+    ExecManifest.requiredProperties ++
       RestApiCommons.requiredProperties ++
       SpiLoader.get[LoadBalancerProvider].requiredProperties ++
       EntitlementProvider.requiredProperties
@@ -190,7 +205,7 @@ object Controller {
     JsObject(
       "description" -> "OpenWhisk".toJson,
       "support" -> JsObject(
-        "github" -> "https://github.com/apache/incubator-openwhisk/issues".toJson,
+        "github" -> "https://github.com/apache/openwhisk/issues".toJson,
         "slack" -> "http://slack.openwhisk.org".toJson),
       "api_paths" -> apis.toJson,
       "limits" -> JsObject(
@@ -206,15 +221,24 @@ object Controller {
         "max_action_logs" -> logLimit.max.toBytes.toJson),
       "runtimes" -> runtimes.toJson)
 
+  def readyState(allInvokers: Int, healthyInvokers: Int, readinessThreshold: Double): Boolean = {
+    if (allInvokers > 0) (healthyInvokers / allInvokers) >= readinessThreshold else false
+  }
+
   def main(args: Array[String]): Unit = {
-    Kamon.loadReportersFromConfig()
     implicit val actorSystem = ActorSystem("controller-actor-system")
     implicit val logger = new AkkaLogging(akka.event.Logging.getLogger(actorSystem, this))
+    start(args)
+  }
+
+  def start(args: Array[String])(implicit actorSystem: ActorSystem, logger: Logging): Unit = {
+    ConfigMXBean.register()
+    Kamon.init()
 
     // Prepare Kamon shutdown
     CoordinatedShutdown(actorSystem).addTask(CoordinatedShutdown.PhaseActorSystemTerminate, "shutdownKamon") { () =>
       logger.info(this, s"Shutting down Kamon with coordinated shutdown")
-      Kamon.stopAllReporters().map(_ => Done)(Implicits.global)
+      Kamon.stopModules().map(_ => Done)(Implicits.global)
     }
 
     // extract configuration data from the environment
@@ -262,7 +286,9 @@ object Controller {
         val httpsConfig =
           if (Controller.protocol == "https") Some(loadConfigOrThrow[HttpsConfig]("whisk.controller.https")) else None
 
-        BasicHttpService.startHttpService(controller.route, port, httpsConfig)(actorSystem, controller.materializer)
+        BasicHttpService.startHttpService(controller.route, port, httpsConfig, interface)(
+          actorSystem,
+          controller.materializer)
 
       case Failure(t) =>
         abort(s"Invalid runtimes manifest: $t")

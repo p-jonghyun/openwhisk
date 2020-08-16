@@ -22,7 +22,7 @@ import java.nio.charset.StandardCharsets
 import java.time.Instant
 
 import org.apache.commons.io.IOUtils
-import org.apache.http.HttpHeaders
+import org.apache.http.{HttpHeaders, NoHttpResponseException}
 import org.apache.http.client.config.RequestConfig
 import org.apache.http.client.methods.{HttpPost, HttpRequestBase}
 import org.apache.http.client.utils.{HttpClientUtils, URIBuilder}
@@ -34,9 +34,12 @@ import org.apache.http.impl.conn.PoolingHttpClientConnectionManager
 import org.apache.http.util.EntityUtils
 import spray.json._
 import org.apache.openwhisk.common.{Logging, TransactionId}
+import org.apache.openwhisk.core.ConfigKeys
 import org.apache.openwhisk.core.entity.ActivationResponse._
 import org.apache.openwhisk.core.entity.ByteSize
 import org.apache.openwhisk.core.entity.size.SizeLong
+import pureconfig._
+import pureconfig.generic.auto._
 
 import scala.annotation.tailrec
 import scala.concurrent._
@@ -64,6 +67,7 @@ protected[containerpool] case class RetryableConnectionError(t: Throwable) exten
 protected class ApacheBlockingContainerClient(hostname: String,
                                               timeout: FiniteDuration,
                                               maxResponse: ByteSize,
+                                              truncation: ByteSize,
                                               maxConcurrent: Int = 1)(implicit logging: Logging, ec: ExecutionContext)
     extends ContainerClient {
 
@@ -87,7 +91,7 @@ protected class ApacheBlockingContainerClient(hostname: String,
    * @param retry whether or not to retry on connection failure
    * @return Left(Error Message) or Right(Status Code, Response as UTF-8 String)
    */
-  def post(endpoint: String, body: JsValue, retry: Boolean)(
+  def post(endpoint: String, body: JsValue, retry: Boolean, reschedule: Boolean = false)(
     implicit tid: TransactionId): Future[Either[ContainerHttpError, ContainerResponse]] = {
     val entity = new StringEntity(body.compactPrint, StandardCharsets.UTF_8)
     entity.setContentType("application/json")
@@ -98,14 +102,18 @@ protected class ApacheBlockingContainerClient(hostname: String,
 
     Future {
       blocking {
-        execute(request, timeout, maxConcurrent, retry)
+        execute(request, timeout, maxConcurrent, retry, reschedule)
       }
     }
   }
 
   // Annotation will make the compiler complain if no tail recursion is possible
-  @tailrec private def execute(request: HttpRequestBase, timeout: FiniteDuration, maxConcurrent: Int, retry: Boolean)(
-    implicit tid: TransactionId): Either[ContainerHttpError, ContainerResponse] = {
+  @tailrec private def execute(
+    request: HttpRequestBase,
+    timeout: FiniteDuration,
+    maxConcurrent: Int,
+    retry: Boolean,
+    reschedule: Boolean = false)(implicit tid: TransactionId): Either[ContainerHttpError, ContainerResponse] = {
     val start = Instant.now
 
     Try(connection.execute(request)).map { response =>
@@ -122,7 +130,7 @@ protected class ApacheBlockingContainerClient(hostname: String,
               Right(ContainerResponse(statusCode, str, None))
             } else {
               // only consume a bounded number of bytes according to the system limits
-              val str = new String(IOUtils.toByteArray(entity.getContent, maxResponseBytes), StandardCharsets.UTF_8)
+              val str = new String(IOUtils.toByteArray(entity.getContent, truncationBytes), StandardCharsets.UTF_8)
               EntityUtils.consumeQuietly(entity) // consume the rest of the stream to free the connection
               Right(ContainerResponse(statusCode, str, Some(contentLength.B, maxResponse)))
             }
@@ -149,8 +157,16 @@ protected class ApacheBlockingContainerClient(hostname: String,
       //
       // NoRouteToHostException: route to target host is not known (yet).
       case t: NoRouteToHostException => Failure(RetryableConnectionError(t))
+
+      //In general with NoHttpResponseException it cannot be said if server has processed the request or not
+      //For some cases like in standalone mode setup it should be fine to retry
+      case t: NoHttpResponseException if ApacheBlockingContainerClient.clientConfig.retryNoHttpResponseException =>
+        Failure(RetryableConnectionError(t))
     } match {
-      case Success(response) => response
+      case Success(response)                                  => response
+      case Failure(_: RetryableConnectionError) if reschedule =>
+        //propagate as a failed future; clients can retry at a different container
+        throw ContainerHealthError(tid, request.getURI.toString)
       case Failure(t: RetryableConnectionError) if retry =>
         if (timeout > Duration.Zero) {
           Thread.sleep(50) // Sleep for 50 milliseconds
@@ -165,6 +181,7 @@ protected class ApacheBlockingContainerClient(hostname: String,
   }
 
   private val maxResponseBytes = maxResponse.toBytes
+  private val truncationBytes = truncation.toBytes
 
   private val baseUri = new URIBuilder()
     .setScheme("http")
@@ -201,7 +218,10 @@ protected class ApacheBlockingContainerClient(hostname: String,
     .build
 }
 
+case class ApacheClientConfig(retryNoHttpResponseException: Boolean)
+
 object ApacheBlockingContainerClient {
+  val clientConfig: ApacheClientConfig = loadConfigOrThrow[ApacheClientConfig](ConfigKeys.apacheClientConfig)
 
   /** A helper method to post one single request to a connection. Used for container tests. */
   def post(host: String, port: Int, endPoint: String, content: JsValue)(
@@ -209,7 +229,7 @@ object ApacheBlockingContainerClient {
     tid: TransactionId,
     ec: ExecutionContext): (Int, Option[JsObject]) = {
     val timeout = 90.seconds
-    val connection = new ApacheBlockingContainerClient(s"$host:$port", timeout, 1.MB)
+    val connection = new ApacheBlockingContainerClient(s"$host:$port", timeout, 1.MB, 1.MB)
     val response = executeRequest(connection, endPoint, content)
     val result = Await.result(response, timeout)
     connection.close()
@@ -221,7 +241,7 @@ object ApacheBlockingContainerClient {
     implicit logging: Logging,
     tid: TransactionId,
     ec: ExecutionContext): Seq[(Int, Option[JsObject])] = {
-    val connection = new ApacheBlockingContainerClient(s"$host:$port", 90.seconds, 1.MB, contents.size)
+    val connection = new ApacheBlockingContainerClient(s"$host:$port", 90.seconds, 1.MB, 1.MB, contents.size)
     val futureResults = contents.map { content =>
       executeRequest(connection, endPoint, content)
     }

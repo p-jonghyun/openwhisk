@@ -25,7 +25,8 @@ import org.apache.openwhisk.core.entity.MemoryLimit
 import org.apache.openwhisk.core.entity.size._
 import org.junit.runner.RunWith
 import org.scalatest.junit.JUnitRunner
-import pureconfig.loadConfigOrThrow
+import pureconfig._
+import pureconfig.generic.auto._
 
 import scala.concurrent.Await
 import scala.concurrent.Future
@@ -75,7 +76,7 @@ class ConcurrencyTests extends TestHelpers with WskTestHelpers with WskActorSyst
 
       //read configs to determine max concurrency support - currently based on single invoker and invokerUserMemory config
       val busyThreshold =
-        (loadConfigOrThrow[ContainerPoolConfig](ConfigKeys.containerPool).userMemory / MemoryLimit.stdMemory).toInt
+        (loadConfigOrThrow[ContainerPoolConfig](ConfigKeys.containerPool).userMemory / MemoryLimit.STD_MEMORY).toInt
 
       //run maximum allowed concurrent actions via Futures
       val requestCount = busyThreshold
@@ -124,7 +125,7 @@ class ConcurrencyTests extends TestHelpers with WskTestHelpers with WskActorSyst
 
       //read configs to determine max concurrency support - currently based on single invoker and invokerUserMemory config
       val busyThreshold =
-        (loadConfigOrThrow[ContainerPoolConfig](ConfigKeys.containerPool).userMemory / MemoryLimit.stdMemory).toInt
+        (loadConfigOrThrow[ContainerPoolConfig](ConfigKeys.containerPool).userMemory / MemoryLimit.STD_MEMORY).toInt
 
       //run maximum allowed concurrent actions via Futures
       val requestCount = busyThreshold

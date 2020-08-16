@@ -24,7 +24,9 @@ import org.junit.runner.RunWith
 import org.scalatest.junit.JUnitRunner
 import common._
 import common.rest.WskRestOperations
+import org.apache.openwhisk.core.entity.Annotations
 import org.apache.commons.io.FileUtils
+import org.apache.openwhisk.core.FeatureFlags
 import spray.json._
 import spray.json.DefaultJsonProtocol._
 
@@ -100,11 +102,11 @@ class WskActionTests extends TestHelpers with WskTestHelpers with JsHelpers with
       action.create(
         name,
         Some(TestUtils.getTestActionFilename("printParams.js")),
-        parameters = params.mapValues(_.toJson))
+        parameters = params.mapValues(_.toJson).toMap)
     }
 
     val invokeParams = Map("payload" -> testString)
-    val run = wsk.action.invoke(name, invokeParams.mapValues(_.toJson))
+    val run = wsk.action.invoke(name, invokeParams.mapValues(_.toJson).toMap)
     withActivation(wsk.activation, run) { activation =>
       val logs = activation.logs.get.mkString(" ")
 
@@ -171,6 +173,7 @@ class WskActionTests extends TestHelpers with WskTestHelpers with JsHelpers with
 
   it should "add new parameters and annotations while copying an action" in withAssetCleaner(wskprops) {
     (wp, assetHelper) =>
+      val runtime = "nodejs:default"
       val origName = "origAction"
       val copiedName = "copiedAction"
       val origParams = Map("origParam1" -> "origParamValue1".toJson, "origParam2" -> 999.toJson)
@@ -182,17 +185,20 @@ class WskActionTests extends TestHelpers with WskTestHelpers with JsHelpers with
         JsObject("key" -> JsString("copiedParam2"), "value" -> JsNumber(123)),
         JsObject("key" -> JsString("origParam1"), "value" -> JsString("origParamValue1")),
         JsObject("key" -> JsString("origParam2"), "value" -> JsNumber(999)))
-      val resAnnots = Seq(
+      val baseAnnots = Seq(
         JsObject("key" -> JsString("origAnnot1"), "value" -> JsString("origAnnotValue1")),
-        JsObject("key" -> JsString("copiedAnnot2"), "value" -> JsBoolean(false)),
+        JsObject("key" -> JsString("copiedAnnot2"), "value" -> JsFalse),
         JsObject("key" -> JsString("copiedAnnot1"), "value" -> JsString("copiedAnnotValue1")),
-        JsObject("key" -> JsString("origAnnot2"), "value" -> JsBoolean(true)),
-        JsObject("key" -> JsString("exec"), "value" -> JsString("nodejs:6")))
+        JsObject("key" -> JsString("origAnnot2"), "value" -> JsTrue),
+        JsObject("key" -> Annotations.ProvideApiKeyAnnotationName.toJson, "value" -> JsFalse))
+      val resAnnots: Seq[JsObject] = if (FeatureFlags.requireApiKeyAnnotation) {
+        baseAnnots ++ Seq(JsObject("key" -> Annotations.ProvideApiKeyAnnotationName.toJson, "value" -> JsFalse))
+      } else baseAnnots
 
       assetHelper.withCleaner(wsk.action, origName) {
         val file = Some(TestUtils.getTestActionFilename("echo.js"))
         (action, _) =>
-          action.create(origName, file, parameters = origParams, annotations = origAnnots)
+          action.create(origName, file, parameters = origParams, annotations = origAnnots, kind = Some(runtime))
       }
 
       assetHelper.withCleaner(wsk.action, copiedName) { (action, _) =>
@@ -202,9 +208,24 @@ class WskActionTests extends TestHelpers with WskTestHelpers with JsHelpers with
 
       val copiedAction = wsk.parseJsonString(wsk.action.get(copiedName).stdout)
 
+      // first we check the returned execution runtime for 'nodejs:*'
+      copiedAction
+        .fields("annotations")
+        .convertTo[Seq[JsObject]]
+        .find(_.fields("key").convertTo[String] == "exec")
+        .map(_.fields("value"))
+        .map(exec => { exec.convertTo[String] should startWith("nodejs:") })
+        .getOrElse(fail())
+
       // CLI does not guarantee order of annotations and parameters so do a diff to compare the values
       copiedAction.fields("parameters").convertTo[Seq[JsObject]] diff resParams shouldBe List.empty
-      copiedAction.fields("annotations").convertTo[Seq[JsObject]] diff resAnnots shouldBe List.empty
+
+      // for the anotations we ignore the exec field here, since we already compared it above
+      copiedAction
+        .fields("annotations")
+        .convertTo[Seq[JsObject]]
+        .filter(annotation => annotation.fields("key").convertTo[String] != "exec") diff resAnnots shouldBe List.empty
+
   }
 
   it should "recreate and invoke a new action with different code" in withAssetCleaner(wskprops) { (wp, assetHelper) =>
@@ -248,7 +269,11 @@ class WskActionTests extends TestHelpers with WskTestHelpers with JsHelpers with
     val child = "wc"
 
     assetHelper.withCleaner(wsk.action, name) { (action, _) =>
-      action.create(name, Some(TestUtils.getTestActionFilename("wcbin.js")))
+      val annotations =
+        if (FeatureFlags.requireApiKeyAnnotation) Map(Annotations.ProvideApiKeyAnnotationName -> JsTrue)
+        else Map.empty[String, JsValue]
+      action.create(name, Some(TestUtils.getTestActionFilename("wcbin.js")), annotations = annotations)
+
     }
     assetHelper.withCleaner(wsk.action, child) { (action, _) =>
       action.create(child, Some(TestUtils.getTestActionFilename("wc.js")))
@@ -291,7 +316,7 @@ class WskActionTests extends TestHelpers with WskTestHelpers with JsHelpers with
       result.getFields("stdout", "code") match {
         case Seq(JsString(stdout), JsNumber(code)) =>
           stdout should not include "bytes from"
-          code.intValue() should not be 0
+          code.intValue should not be 0
         case _ => fail(s"fields 'stdout' or 'code' where not of the expected format, was $result")
       }
     }

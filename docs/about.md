@@ -40,7 +40,7 @@ Being an open-source project, OpenWhisk stands on the shoulders of giants, inclu
 
 ## Creating the action
 
-To give the explanation a little bit of context, let’s create an action in the system first. We will use that action to explain the concepts later on while tracing through the system. The following commands assume that the [OpenWhisk CLI is setup properly](https://github.com/apache/incubator-openwhisk/blob/master/docs/cli.md).
+To give the explanation a little bit of context, let’s create an action in the system first. We will use that action to explain the concepts later on while tracing through the system. The following commands assume that the [OpenWhisk CLI is setup properly](https://github.com/apache/openwhisk/blob/master/docs/cli.md).
 
 First, we’ll create a file *action.js* containing the following code which will print “Hello World” to stdout and return a JSON object containing “world” under the key “hello”.
 ```
@@ -65,7 +65,7 @@ What actually happens behind the scenes in OpenWhisk?
 
 ### Entering the system: nginx
 
-First: OpenWhisk’s user-facing API is completely HTTP based and follows a RESTful design. As a consequence, the command sent via the wsk-CLI is essentially an HTTP request against the OpenWhisk system. The specific command above translates roughly to:
+First: OpenWhisk’s user-facing API is completely HTTP based and follows a RESTful design. As a consequence, the command sent via the `wsk` CLI is essentially an HTTP request against the OpenWhisk system. The specific command above translates roughly to:
 ```
 POST /api/v1/namespaces/$userNamespace/actions/myAction
 Host: $openwhiskEndpoint

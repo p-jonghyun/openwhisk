@@ -17,18 +17,13 @@
 
 package org.apache.openwhisk.core.limits
 
-import scala.concurrent.duration.DurationInt
+import java.io.File
 
+import scala.concurrent.duration.DurationInt
 import org.junit.runner.RunWith
 import org.scalatest.junit.JUnitRunner
-
-import common.TestHelpers
-import common.TestUtils
+import common.{ConcurrencyHelpers, TestHelpers, TestUtils, WskActorSystem, WskProps, WskTestHelpers}
 import common.rest.WskRestOperations
-import common.WskProps
-import common.WskTestHelpers
-import common.WskActorSystem
-
 import org.apache.openwhisk.core.entity._
 import spray.json.DefaultJsonProtocol._
 import spray.json._
@@ -40,7 +35,7 @@ import org.scalatest.tagobjects.Slow
  * Tests for action duration limits. These tests require a deployed backend.
  */
 @RunWith(classOf[JUnitRunner])
-class MaxActionDurationTests extends TestHelpers with WskTestHelpers with WskActorSystem {
+class MaxActionDurationTests extends TestHelpers with WskTestHelpers with WskActorSystem with ConcurrencyHelpers {
 
   implicit val wskprops = WskProps()
   val wsk = new WskRestOperations
@@ -64,7 +59,13 @@ class MaxActionDurationTests extends TestHelpers with WskTestHelpers with WskAct
   "node-, python, and java-action" should s"run up to the max allowed duration (${TimeLimit.MAX_DURATION})" taggedAs (Slow) in withAssetCleaner(
     wskprops) { (wp, assetHelper) =>
     // When you add more runtimes, keep in mind, how many actions can be processed in parallel by the Invokers!
-    Map("node" -> "helloDeadline.js", "python" -> "sleep.py", "java" -> "sleep.jar").par.map {
+    val runtimes = Map("node" -> "helloDeadline.js", "python" -> "sleep.py", "java" -> "sleep.jar")
+      .filter {
+        case (_, name) =>
+          new File(TestUtils.getTestActionFilename(name)).exists()
+      }
+
+    concurrently(runtimes.toSeq, TimeLimit.MAX_DURATION + 2.minutes) {
       case (k, name) =>
         println(s"Testing action kind '${k}' with action '${name}'")
         assetHelper.withCleaner(wsk.action, name) { (action, _) =>
@@ -79,6 +80,7 @@ class MaxActionDurationTests extends TestHelpers with WskTestHelpers with WskAct
         val run = wsk.action.invoke(
           name,
           Map("forceHang" -> true.toJson, "sleepTimeInMs" -> (TimeLimit.MAX_DURATION + 30.seconds).toMillis.toJson))
+
         withActivation(
           wsk.activation,
           run,
@@ -92,7 +94,6 @@ class MaxActionDurationTests extends TestHelpers with WskTestHelpers with WskAct
             activation.duration.toInt should be >= TimeLimit.MAX_DURATION.toMillis.toInt
           }
         }
-        () // explicitly map to Unit
     }
   }
 }

@@ -23,6 +23,7 @@ SCRIPTDIR=$(cd $(dirname "$0") && pwd)
 ROOTDIR="$SCRIPTDIR/../.."
 
 cd $ROOTDIR/tools/travis
+export TESTCONTAINERS_RYUK_DISABLED="true"
 export ORG_GRADLE_PROJECT_testSetName="REQUIRE_ONLY_DB"
 
 ./scan.sh
@@ -34,4 +35,3 @@ cat "$ROOTDIR/tests/src/test/resources/application.conf"
 ./distDocker.sh
 
 ./runTests.sh
-

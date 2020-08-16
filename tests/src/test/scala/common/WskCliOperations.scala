@@ -517,14 +517,11 @@ class CliActivationOperations(val wsk: RunCliCmd) extends ActivationOperations w
    * @return sequence of activations
    */
   def ids(rr: RunResult): Seq[String] = {
-    rr.stdout.split("\n") filter {
-      // remove empty lines the header
-      s =>
-        s.nonEmpty && s != "activations"
-    } map {
-      // split into (id, name)
-      _.split(" ")(0)
-    }
+    val lines = rr.stdout.split("\n")
+    val header = lines(0)
+    // old format has the activation id first, new format has activation id in third column
+    val column = if (header.startsWith("activations")) 0 else 2
+    lines.drop(1).map(_.split(" ")(column)) // drop the header and grab just the activationId column
   }
 
   /**
@@ -712,7 +709,7 @@ class CliNamespaceOperations(override val wsk: RunCliCmd)
    */
   override def whois()(implicit wskprops: WskProps): String = {
     // the invariant that list() returns a conforming result is enforced in WskRestBasicTests
-    val ns = list().stdout.lines.toSeq.last.trim
+    val ns = list().stdout.linesIterator.toSeq.last.trim
     assert(ns != "_") // this is not permitted
     ns
   }
@@ -972,10 +969,5 @@ class CliGatewayOperations(val wsk: RunCliCmd) extends GatewayOperations {
 
 object Wsk {
   val binaryName = "wsk"
-  val defaultCliPath = if (WhiskProperties.useCLIDownload) getDownloadedGoCLIPath else WhiskProperties.getCLIPath
-
-  /** What is the path to a downloaded CLI? **/
-  private def getDownloadedGoCLIPath = {
-    s"${System.getProperty("user.home")}${File.separator}.local${File.separator}bin${File.separator}${binaryName}"
-  }
+  val defaultCliPath = WhiskProperties.getCLIPath
 }

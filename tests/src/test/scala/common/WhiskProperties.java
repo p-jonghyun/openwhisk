@@ -34,7 +34,7 @@ public class WhiskProperties {
     /**
      * System property key which refers to OpenWhisk Edge Host url
      */
-    private static final String WHISK_SERVER = "whisk.server";
+    public static final String WHISK_SERVER = "whisk.server";
 
     /**
      * System property key which refers to authentication key to be used for testing
@@ -115,25 +115,31 @@ public class WhiskProperties {
     }
 
     /**
-     * The path to the CLI directory.
-     */
-    public static String getCLIDir() {
-        return whiskHome + "/bin";
-    }
-
-    /**
      * The path to the Go CLI executable.
      */
     public static String getCLIPath() {
-        return getCLIDir() + "/wsk";
+        return whiskHome + "/bin/wsk";
     }
 
     public static File getFileRelativeToWhiskHome(String name) {
         return new File(whiskHome, name);
     }
 
-    public static String getProperty(String string) {
-        return whiskProperties.getProperty(string);
+    public static int getControllerInstances() {
+        return Integer.parseInt(whiskProperties.getProperty("controller.instances"));
+    }
+
+    public static String getProperty(String name) {
+        return whiskProperties.getProperty(name);
+    }
+
+    public static Boolean getBooleanProperty(String name, Boolean defaultValue) {
+        String value = whiskProperties.getProperty(name);
+        if (value == null) {
+            return defaultValue;
+        }
+
+        return Boolean.parseBoolean(value);
     }
 
     public static String getKafkaHosts() {
@@ -150,10 +156,6 @@ public class WhiskProperties {
 
     public static String getMainDockerEndpoint() {
         return whiskProperties.getProperty("main.docker.endpoint");
-    }
-
-    public static boolean useCLIDownload() {
-        return whiskProperties.getProperty("use.cli.download").equals("true");
     }
 
     public static String[] getInvokerHosts() {
@@ -217,7 +219,12 @@ public class WhiskProperties {
     }
 
     public static String getApiHostForAction() {
-        return getApiProto() + "://" + getApiHost() + ":" + getApiPort();
+        String apihost = getApiProto() + "://" + getApiHost() + ":" + getApiPort();
+        if (apihost.startsWith("https://") && apihost.endsWith(":443")) {
+            return apihost.replaceAll(":443", "");
+        } else if (apihost.startsWith("http://") && apihost.endsWith(":80")) {
+            return apihost.replaceAll(":80", "");
+        } else return apihost;
     }
 
     public static String getApiHostForClient(String subdomain, boolean includeProtocol) {

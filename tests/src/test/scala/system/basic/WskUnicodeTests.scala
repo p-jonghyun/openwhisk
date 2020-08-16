@@ -18,7 +18,7 @@
 package system.basic
 
 import java.io.File
-import com.jayway.restassured.RestAssured
+import io.restassured.RestAssured
 import org.junit.runner.RunWith
 import org.scalatest.junit.JUnitRunner
 
@@ -50,12 +50,11 @@ class WskUnicodeTests extends TestHelpers with WskTestHelpers with JsHelpers wit
   println(s"Kinds to test: ${actionKinds.map(_.kind).mkString(", ")}")
 
   def main(kind: String): Option[String] = {
-    kind match {
-      case "java" => Some("Unicode")
-      case s if (s.contains("dotnet")) =>
-        Some("Apache.OpenWhisk.UnicodeTests.Dotnet::Apache.OpenWhisk.UnicodeTests.Dotnet.Unicode::Main")
-      case _ => None
-    }
+    if (kind.startsWith("java")) {
+      Some("Unicode")
+    } else if (kind.contains("dotnet")) {
+      Some("Apache.OpenWhisk.UnicodeTests.Dotnet::Apache.OpenWhisk.UnicodeTests.Dotnet.Unicode::Main")
+    } else None
   }
 
   def getFileLocation(kind: String): Option[String] = {

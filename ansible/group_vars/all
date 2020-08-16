@@ -1,11 +1,25 @@
-# Licensed to the Apache Software Foundation (ASF) under one or more contributor
-# license agreements; and to You under the Apache License, Version 2.0.
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
 
 mode: deploy
 lean: false
 prompt_user: true
 openwhisk_home: "{{ lookup('env', 'OPENWHISK_HOME') | default(playbook_dir ~ '/..', true) }}"
-openwhisk_cli_home: "{{ lookup('env', 'OPENWHISK_CLI') | default(openwhisk_home ~ '/../incubator-openwhisk-cli', true) }}"
+openwhisk_cli_home: "{{ lookup('env', 'OPENWHISK_CLI') | default(openwhisk_home ~ '/../openwhisk-cli', true) }}"
 exclude_logs_from: []
 
 # This whisk_api_localhost_name_default is used to configure nginx to permit vanity URLs for web actions
@@ -29,17 +43,20 @@ whisk_api_localhost_name_default: "localhost"
 environmentInformation:
   type: "{{ environment_type | default('local') }}"
 
-hosts_dir: "{{ inventory_dir | default(env_hosts_dir) }}"
+hosts_dir: "{{ inventory_dir | default(env_hosts_dir) }}"
 
 whisk:
   version:
     date: "{{ansible_date_time.iso8601}}"
+  feature_flags:
+    require_api_key_annotation: "{{ require_api_key_annotation | default(true) | lower  }}"
 
 ##
 # configuration parameters related to support runtimes (see org.apache.openwhisk.core.entity.ExecManifest for schema of the manifest).
 # briefly the parameters are:
 #
-#   runtimes_registry: optional registry (with trailing slack) where to pull docker images from for runtimes and backbox images
+#   runtimes_registry: optional registry (with trailing slash) where to pull docker images from for default runtimes (in manifest)
+#   user_images_registry: optional registry (with trailing slash) where to pull docker images from for blackbox images
 #
 #   skip_pull_runtimes: this will skip pulling the images to the invoker (images must exist there somehow)
 #
@@ -74,6 +91,7 @@ controller:
   managedFraction: "{{ controller_managed_fraction | default(1.0 - (controller_blackbox_fraction | default(__controller_blackbox_fraction))) }}"
   blackboxFraction: "{{ controller_blackbox_fraction | default(__controller_blackbox_fraction) }}"
   timeoutFactor: "{{ controller_timeout_factor | default(2) }}"
+  timeoutAddon: "{{ controller_timeout_addon | default('1 m') }}"
   instances: "{{ groups['controllers'] | length }}"
   akka:
     provider: local
@@ -132,7 +150,7 @@ kafka:
     protocols:
     - TLSv1.2
   protocol: "{{ kafka_protocol_for_setup }}"
-  version: 0.11.0.1
+  version: 2.12-2.3.1
   port: 9072
   advertisedPort: 9093
   ras:
@@ -181,6 +199,8 @@ invoker:
   useRunc: "{{ invoker_use_runc | default(true) }}"
   docker:
     become: "{{ invoker_docker_become | default(false) }}"
+    runcdir: "{{ invoker_runcdir | default('/run/docker/runtime-runc/moby') }}"
+    volumes: "{{ invoker_docker_volumes | default([]) }}"
   loglevel: "{{ invoker_loglevel | default(whisk_loglevel) | default('INFO') }}"
   jmxremote:
     jvmArgs: "{% if inventory_hostname in groups['invokers'] %}
@@ -207,18 +227,17 @@ nginx:
   htmldir: "{{ ui_path | default(false) }}"
   dir:
     become: "{{ nginx_dir_become | default(false) }}"
-  version: "{{ nginx_version | default('1.13') }}"
+  version: "{{ nginx_version | default('1.17') }}"
   port:
     http: 80
-    api: 443
+    https: 443
   ssl:
-    path: "{{ openwhisk_home }}/ansible/roles/nginx/files"
-    cert: "openwhisk-server-cert.pem"
-    key: "openwhisk-server-key.pem"
-    password_enabled: false
-    password_file: "ssl.pass"
-    client_ca_cert: "{{ openwhisk_client_ca_cert | default('openwhisk-client-ca-cert.pem') }}"
+    path: "{{ nginx_ssl_path | default(playbook_dir +'/roles/nginx/files') }}"
+    cert: "{{ nginx_ssl_server_cert | default('openwhisk-server-cert.pem') }}"
+    key: "{{ nginx_ssl_server_key | default('openwhisk-server-key.pem') }}"
+    client_ca_cert: "{{ nginx_ssl_client_ca_cert | default('openwhisk-client-ca-cert.pem') }}"
     verify_client: "{{ nginx_ssl_verify_client | default('off') }}"
+    password_file: "{{ nginx_ssl_password_file | default(false) }}"
   wpn:
     router: "{{ nginx_wpn_router | default('1') }}"
   special_users: "{{ nginx_special_users | default('[]') }}"
@@ -254,13 +273,34 @@ db:
     invoker:
       user: "{{ db_invoker_user | default(lookup('ini', 'db_username section=invoker file={{ playbook_dir }}/db_local.ini')) }}"
       pass: "{{ db_invoker_pass | default(lookup('ini', 'db_password section=invoker file={{ playbook_dir }}/db_local.ini')) }}"
+  activation_store:
+    backend: "{{ db_activation_backend | default('CouchDB') }}"
+  elasticsearch:
+    protocol: "{{ elastic_protocol | default('http') }}"
+    port: 9200
+    index_pattern: "{{ elastic_index_pattern | default('openwhisk-%s') }}"
+    base_transport_port: 9300
+    confdir: "{{ config_root_dir }}/elasticsearch"
+    dir:
+      become: "{{ elastic_dir_become | default(false) }}"
+    base_volume: "{{ elastic_base_volume | default('esdata') }}"
+    cluster_name: "{{ elastic_cluster_name | default('openwhisk') }}"
+    java_opts: "{{ elastic_java_opts | default('-Xms1g -Xmx1g') }}"
+    loglevel: "{{ elastic_loglevel | default('INFO') }}"
+    # the user id of elasticsearch process, default is 1000, if you have enabled user namespace
+    # for docker daemon, this need to be changed correspondingly
+    uid: "{{ elastic_uid | default(1000) }}"
+    auth:
+      admin:
+        username: "{{ elastic_username | default('admin') }}"
+        password: "{{ elastic_password | default('admin') }}"
 
 apigateway:
   port:
     api: 9000
     mgmt: 9001
-  # apigateway is an Apahce OpenWhisk project, so default to latest
-  version: latest
+  # Default to 'nightly', which tracks the head revision of the master branch of apigateway's gitrepo
+  version: nightly
 
 redis:
   version: 4.0
@@ -274,6 +314,15 @@ couchdb:
   docker_image: treehouses/couchdb
   version: 2.1.0
   pull_couchdb: true
+
+elasticsearch:
+  version: 6.7.2
+
+elasticsearch_connect_string: "{% set ret = [] %}\
+                               {% for host in groups['elasticsearch'] %}\
+                               {{ ret.append( hostvars[host].ansible_host + ':' + ((db.elasticsearch.port+loop.index-1)|string) ) }}\
+                               {% endfor %}\
+                               {{ ret | join(',') }}"
 
 docker:
   # The user to install docker for. Defaults to the ansible user if not set. This will be the user who is able to run
@@ -301,8 +350,8 @@ catalog_namespace: "/whisk.system"
 # The catalog_auth_key is used to determine the secret key to authenticate the openwhisk service.
 # The value for this variable can be set to either the secret key itself or the file, which
 # saves the secret key.
-# By default, we take the key from {{ openwhisk_home }}/ansible/files/auth.whisk.system.
-catalog_auth_key: "{{ openwhisk_home }}/ansible/files/auth.whisk.system"
+# By default, we take the key from ansible/files/auth.whisk.system.
+catalog_auth_key: "{{ playbook_dir }}/files/auth.whisk.system"
 
 # The catalog_repos is used to specify all the catalog names and repository URLs,
 # so that openwhisk knows where to download the catalog and install them. The key
@@ -326,7 +375,7 @@ catalog_auth_key: "{{ openwhisk_home }}/ansible/files/auth.whisk.system"
 #
 catalog_repos:
   openwhisk-catalog:
-    url: https://github.com/apache/incubator-openwhisk-catalog.git
+    url: https://github.com/apache/openwhisk-catalog.git
     # Set the local location as the same level as openwhisk home, but it can be changed.
     location: "{{ openwhisk_home }}/../openwhisk-catalog"
     version: "HEAD"
@@ -356,7 +405,7 @@ openwhisk_cli:
   local:
     location: "{{ openwhisk_cli_home }}/build"
   remote:
-    location: "https://github.com/apache/incubator-openwhisk-cli/releases/download/{{ openwhisk_cli_tag }}"
+    location: "https://github.com/apache/openwhisk-cli/releases/download/{{ openwhisk_cli_tag }}"
 
 # Controls access to log directories
 logs:
@@ -373,4 +422,4 @@ metrics:
     host: "{{ metrics_kamon_statsd_host | default('') }}"
     port: "{{ metrics_kamon_statsd_port | default('8125') }}"
 
-user_events: "{{ user_events_enabled | default(false) }}"
+user_events: "{{ user_events_enabled | default(false) | lower }}"

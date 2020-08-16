@@ -18,15 +18,16 @@
 package org.apache.openwhisk.core.database.cosmosdb
 
 import com.microsoft.azure.cosmosdb.{Database, SqlParameter, SqlParameterCollection, SqlQuerySpec}
-import org.scalatest.{BeforeAndAfterAll, FlatSpec}
-import pureconfig.loadConfigOrThrow
+import org.scalatest.{BeforeAndAfterAll, FlatSpecLike}
+import pureconfig._
+import pureconfig.generic.auto._
 import org.apache.openwhisk.core.ConfigKeys
 import org.apache.openwhisk.core.database.test.behavior.ArtifactStoreTestUtil.storeAvailable
 
 import scala.collection.mutable.ListBuffer
 import scala.util.{Random, Try}
 
-trait CosmosDBTestSupport extends FlatSpec with BeforeAndAfterAll with RxObservableImplicits {
+trait CosmosDBTestSupport extends FlatSpecLike with BeforeAndAfterAll with RxObservableImplicits {
   private val dbsToDelete = ListBuffer[Database]()
 
   lazy val storeConfigTry = Try { loadConfigOrThrow[CosmosDBConfig](ConfigKeys.cosmosdb) }

@@ -24,9 +24,9 @@ import java.time.format.DateTimeFormatter
 import akka.event.Logging._
 import akka.event.LoggingAdapter
 import kamon.Kamon
-import kamon.metric.{Counter => KCounter, Histogram => KHistogram}
+import kamon.metric.{MeasurementUnit, Counter => KCounter, Gauge => KGauge, Histogram => KHistogram}
 import kamon.statsd.{MetricKeyGenerator, SimpleMetricKeyGenerator}
-import kamon.system.SystemMetrics
+import kamon.tag.TagSet
 import org.apache.openwhisk.core.entity.ControllerInstanceId
 
 trait Logging {
@@ -83,7 +83,7 @@ trait Logging {
    * @param from Reference, where the method was called from.
    * @param message Message to write to the log if not empty
    */
-  protected[common] def emit(loglevel: LogLevel, id: TransactionId, from: AnyRef, message: => String)
+  protected[common] def emit(loglevel: LogLevel, id: TransactionId, from: AnyRef, message: => String): Unit
 }
 
 /**
@@ -95,9 +95,14 @@ class AkkaLogging(loggingAdapter: LoggingAdapter) extends Logging {
       val logmsg: String = message // generates the message
       if (logmsg.nonEmpty) { // log it only if its not empty
         val name = if (from.isInstanceOf[String]) from else Logging.getCleanSimpleClassName(from.getClass)
-        loggingAdapter.log(loglevel, s"[$id] [$name] $logmsg")
+        loggingAdapter.log(loglevel, format(id, name.toString, logmsg))
       }
     }
+  }
+
+  protected def format(id: TransactionId, name: String, logmsg: String) = {
+    val currentId = if (id.hasParent) id else ""
+    s"[${id.root}] [$currentId] [$name] $logmsg"
   }
 }
 
@@ -122,8 +127,9 @@ class PrintStreamLogging(outputStream: PrintStream = Console.out) extends Loggin
       case msg if msg.nonEmpty =>
         msg.split('\n').map(_.trim).mkString(" ")
     }
+    val currentId = if (id.hasParent) id else ""
 
-    val parts = Seq(s"[$time]", s"[$level]", s"[$id]") ++ Seq(s"[$name]") ++ logMessage
+    val parts = Seq(s"[$time]", s"[$level]", s"[${id.root}]", s"[$currentId]") ++ Seq(s"[$name]") ++ logMessage
     outputStream.println(parts.mkString(" "))
   }
 }
@@ -181,11 +187,12 @@ private object Emitter {
  * @param subAction more specific identifier for "action", like `runc.resume`
  * @param tags tags can be used for whatever granularity you might need.
  */
-case class LogMarkerToken(component: String,
-                          action: String,
-                          state: String,
-                          subAction: Option[String] = None,
-                          tags: Map[String, String] = Map.empty) {
+case class LogMarkerToken(
+  component: String,
+  action: String,
+  state: String,
+  subAction: Option[String] = None,
+  tags: Map[String, String] = Map.empty)(measurementUnit: MeasurementUnit = MeasurementUnit.none) {
   private var finishToken: LogMarkerToken = _
   private var errorToken: LogMarkerToken = _
 
@@ -193,6 +200,7 @@ case class LogMarkerToken(component: String,
   // (given the same key) are always the same, so a missed update is not harmful
   private var _counter: KCounter = _
   private var _histogram: KHistogram = _
+  private var _gauge: KGauge = _
 
   override val toString = component + "_" + action + "_" + state
   val toStringWithSubAction: String =
@@ -200,14 +208,14 @@ case class LogMarkerToken(component: String,
 
   def asFinish: LogMarkerToken = {
     if (finishToken == null) {
-      finishToken = copy(state = LoggingMarkers.finish)
+      finishToken = copy(state = LoggingMarkers.finish)(measurementUnit)
     }
     finishToken
   }
 
   def asError: LogMarkerToken = {
     if (errorToken == null) {
-      errorToken = copy(state = LoggingMarkers.error)
+      errorToken = copy(state = LoggingMarkers.error)(measurementUnit)
     }
     errorToken
   }
@@ -226,23 +234,34 @@ case class LogMarkerToken(component: String,
     _histogram
   }
 
+  def gauge: KGauge = {
+    if (_gauge == null) {
+      _gauge = createGauge()
+    }
+    _gauge
+  }
+
   private def createCounter() = {
     if (TransactionId.metricsKamonTags) {
-      Kamon
-        .counter(createName(toString, "counter"))
-        .refine(tags)
+      Kamon.counter(createName(toString, "counter")).withTags(TagSet.from(tags))
     } else {
-      Kamon.counter(createName(toStringWithSubAction, "counter"))
+      Kamon.counter(createName(toStringWithSubAction, "counter")).withoutTags()
     }
   }
 
   private def createHistogram() = {
     if (TransactionId.metricsKamonTags) {
-      Kamon
-        .histogram(createName(toString, "histogram"))
-        .refine(tags)
+      Kamon.histogram(createName(toString, "histogram"), measurementUnit).withTags(TagSet.from(tags))
     } else {
-      Kamon.histogram(createName(toStringWithSubAction, "histogram"))
+      Kamon.histogram(createName(toStringWithSubAction, "histogram"), measurementUnit).withoutTags()
+    }
+  }
+
+  private def createGauge() = {
+    if (TransactionId.metricsKamonTags) {
+      Kamon.gauge(createName(toString, "gauge"), measurementUnit).withTags(TagSet.from(tags))
+    } else {
+      Kamon.gauge(createName(toStringWithSubAction, "gauge"), measurementUnit).withoutTags()
     }
   }
 
@@ -269,16 +288,12 @@ object LogMarkerToken {
       case a :: s :: _ => (a, Some(s))
     }
 
-    LogMarkerToken(component, generalAction, state, subAction)
+    LogMarkerToken(component, generalAction, state, subAction)(MeasurementUnit.none)
   }
 
 }
 
 object MetricEmitter {
-  if (TransactionId.metricsKamon) {
-    SystemMetrics.startCollecting()
-  }
-
   def emitCounterMetric(token: LogMarkerToken, times: Long = 1): Unit = {
     if (TransactionId.metricsKamon) {
       token.counter.increment(times)
@@ -288,6 +303,12 @@ object MetricEmitter {
   def emitHistogramMetric(token: LogMarkerToken, value: Long): Unit = {
     if (TransactionId.metricsKamon) {
       token.histogram.record(value)
+    }
+  }
+
+  def emitGaugeMetric(token: LogMarkerToken, value: Long): Unit = {
+    if (TransactionId.metricsKamon) {
+      token.gauge.update(value)
     }
   }
 }
@@ -300,7 +321,7 @@ object MetricEmitter {
  */
 class WhiskStatsDMetricKeyGenerator(config: com.typesafe.config.Config) extends MetricKeyGenerator {
   val simpleGen = new SimpleMetricKeyGenerator(config)
-  override def generateKey(name: String, tags: Map[String, String]): String = {
+  override def generateKey(name: String, tags: TagSet): String = {
     val key = simpleGen.generateKey(name, tags)
     if (key.contains(".counter_")) key.replace(".counter_", ".counter.")
     else if (key.contains(".histogram_")) key.replace(".histogram_", ".histogram.")
@@ -313,7 +334,7 @@ object LoggingMarkers {
   val start = "start"
   val finish = "finish"
   val error = "error"
-  val count = "count"
+  val counter = "counter"
   val timeout = "timeout"
 
   private val controller = "controller"
@@ -323,97 +344,237 @@ object LoggingMarkers {
   private val kafka = "kafka"
   private val loadbalancer = "loadbalancer"
   private val containerClient = "containerClient"
+  private val containerPool = "containerPool"
+
+  /*
+   * The following markers are used to emit log messages as well as metrics. Add all LogMarkerTokens below to
+   * have a reference list of all metrics. The list below contains LogMarkerToken singletons (val) as well as
+   * LogMarkerToken creation functions (def). The LogMarkerToken creation functions allow to include variable
+   * information in metrics, such as the controller / invoker id or commands executed by a container factory.
+   *
+   * When using LogMarkerTokens for emitting metrics, you should use the convenience functions only once to
+   * create LogMarkerToken singletons instead of creating LogMarkerToken instances over and over again for each
+   * metric emit.
+   *
+   * Example:
+   * val MY_COUNTER_GREEN = LoggingMarkers.MY_COUNTER(GreenCounter)
+   * ...
+   * MetricEmitter.emitCounterMetric(MY_COUNTER_GREEN)
+   *
+   * instead of
+   *
+   * MetricEmitter.emitCounterMetric(LoggingMarkers.MY_COUNTER(GreenCounter))
+   */
 
   /*
    * Controller related markers
    */
-  def CONTROLLER_STARTUP(id: String) = LogMarkerToken(controller, s"startup$id", count)
+  def CONTROLLER_STARTUP(id: String) =
+    if (TransactionId.metricsKamonTags)
+      LogMarkerToken(controller, s"startup", counter, None, Map("controller_id" -> id))(MeasurementUnit.none)
+    else LogMarkerToken(controller, s"startup$id", counter)(MeasurementUnit.none)
 
   // Time of the activation in controller until it is delivered to Kafka
-  val CONTROLLER_ACTIVATION = LogMarkerToken(controller, activation, start)
-  val CONTROLLER_ACTIVATION_BLOCKING = LogMarkerToken(controller, "blockingActivation", start)
+  val CONTROLLER_ACTIVATION =
+    LogMarkerToken(controller, activation, start)(MeasurementUnit.time.milliseconds)
+  val CONTROLLER_ACTIVATION_BLOCKING =
+    LogMarkerToken(controller, "blockingActivation", start)(MeasurementUnit.time.milliseconds)
   val CONTROLLER_ACTIVATION_BLOCKING_DATABASE_RETRIEVAL =
-    LogMarkerToken(controller, "blockingActivationDatabaseRetrieval", count)
+    LogMarkerToken(controller, "blockingActivationDatabaseRetrieval", counter)(MeasurementUnit.none)
 
   // Time that is needed to load balance the activation
-  val CONTROLLER_LOADBALANCER = LogMarkerToken(controller, loadbalancer, start)
+  val CONTROLLER_LOADBALANCER = LogMarkerToken(controller, loadbalancer, start)(MeasurementUnit.none)
 
   // Time that is needed to produce message in kafka
-  val CONTROLLER_KAFKA = LogMarkerToken(controller, kafka, start)
+  val CONTROLLER_KAFKA = LogMarkerToken(controller, kafka, start)(MeasurementUnit.time.milliseconds)
 
   // System overload and random invoker assignment
-  val MANAGED_SYSTEM_OVERLOAD = LogMarkerToken(controller, "managedInvokerSystemOverload", count)
-  val BLACKBOX_SYSTEM_OVERLOAD = LogMarkerToken(controller, "blackBoxInvokerSystemOverload", count)
+  val MANAGED_SYSTEM_OVERLOAD =
+    LogMarkerToken(controller, "managedInvokerSystemOverload", counter)(MeasurementUnit.none)
+  val BLACKBOX_SYSTEM_OVERLOAD =
+    LogMarkerToken(controller, "blackBoxInvokerSystemOverload", counter)(MeasurementUnit.none)
   /*
    * Invoker related markers
    */
-  def INVOKER_STARTUP(i: Int) = LogMarkerToken(invoker, s"startup$i", count)
+  def INVOKER_STARTUP(i: Int) =
+    if (TransactionId.metricsKamonTags)
+      LogMarkerToken(invoker, s"startup", counter, None, Map("invoker_id" -> i.toString))(MeasurementUnit.none)
+    else LogMarkerToken(invoker, s"startup$i", counter)(MeasurementUnit.none)
 
   // Check invoker healthy state from loadbalancer
   def LOADBALANCER_INVOKER_STATUS_CHANGE(state: String) =
-    LogMarkerToken(loadbalancer, "invokerState", count, Some(state))
-  val LOADBALANCER_ACTIVATION_START = LogMarkerToken(loadbalancer, "activations", count)
+    LogMarkerToken(loadbalancer, "invokerState", counter, Some(state), Map("state" -> state))(MeasurementUnit.none)
+  val LOADBALANCER_ACTIVATION_START = LogMarkerToken(loadbalancer, "activations", counter)(MeasurementUnit.none)
 
-  def LOADBALANCER_ACTIVATIONS_INFLIGHT(controllerInstance: ControllerInstanceId) =
-    LogMarkerToken(loadbalancer + controllerInstance.asString, "activationsInflight", count)
+  def LOADBALANCER_ACTIVATIONS_INFLIGHT(controllerInstance: ControllerInstanceId) = {
+    if (TransactionId.metricsKamonTags)
+      LogMarkerToken(
+        loadbalancer,
+        "activationsInflight",
+        counter,
+        None,
+        Map("controller_id" -> controllerInstance.asString))(MeasurementUnit.none)
+    else
+      LogMarkerToken(loadbalancer + controllerInstance.asString, "activationsInflight", counter)(MeasurementUnit.none)
+  }
   def LOADBALANCER_MEMORY_INFLIGHT(controllerInstance: ControllerInstanceId, actionType: String) =
-    LogMarkerToken(loadbalancer + controllerInstance.asString, s"memory${actionType}Inflight", count)
+    if (TransactionId.metricsKamonTags)
+      LogMarkerToken(
+        loadbalancer,
+        s"memory${actionType}Inflight",
+        counter,
+        None,
+        Map("controller_id" -> controllerInstance.asString))(MeasurementUnit.none)
+    else
+      LogMarkerToken(loadbalancer + controllerInstance.asString, s"memory${actionType}Inflight", counter)(
+        MeasurementUnit.none)
+
+  // Counter metrics for completion acks in load balancer
+  sealed abstract class CompletionAckType(val name: String) { def asString: String = name }
+  case object RegularCompletionAck extends CompletionAckType("regular")
+  case object ForcedCompletionAck extends CompletionAckType("forced")
+  case object HealthcheckCompletionAck extends CompletionAckType("healthcheck")
+  case object RegularAfterForcedCompletionAck extends CompletionAckType("regularAfterForced")
+  case object ForcedAfterRegularCompletionAck extends CompletionAckType("forcedAfterRegular")
+
+  // Convenience function to create log marker tokens used for emitting counter metrics related to completion acks.
+  def LOADBALANCER_COMPLETION_ACK(controllerInstance: ControllerInstanceId, completionAckType: CompletionAckType) =
+    if (TransactionId.metricsKamonTags)
+      LogMarkerToken(
+        loadbalancer,
+        "completionAck",
+        counter,
+        None,
+        Map("controller_id" -> controllerInstance.asString, "type" -> completionAckType.asString))(MeasurementUnit.none)
+    else
+      LogMarkerToken(
+        loadbalancer + controllerInstance.asString,
+        "completionAck_" + completionAckType.asString,
+        counter)(MeasurementUnit.none)
 
   // Time that is needed to execute the action
-  val INVOKER_ACTIVATION_RUN = LogMarkerToken(invoker, "activationRun", start)
+  val INVOKER_ACTIVATION_RUN =
+    LogMarkerToken(invoker, "activationRun", start)(MeasurementUnit.time.milliseconds)
 
   // Time that is needed to init the action
-  val INVOKER_ACTIVATION_INIT = LogMarkerToken(invoker, "activationInit", start)
+  val INVOKER_ACTIVATION_INIT =
+    LogMarkerToken(invoker, "activationInit", start)(MeasurementUnit.time.milliseconds)
 
   // Time needed to collect the logs
-  val INVOKER_COLLECT_LOGS = LogMarkerToken(invoker, "collectLogs", start)
+  val INVOKER_COLLECT_LOGS =
+    LogMarkerToken(invoker, "collectLogs", start)(MeasurementUnit.time.milliseconds)
 
   // Time in invoker
-  val INVOKER_ACTIVATION = LogMarkerToken(invoker, activation, start)
-  def INVOKER_DOCKER_CMD(cmd: String) = LogMarkerToken(invoker, "docker", start, Some(cmd), Map("cmd" -> cmd))
+  val INVOKER_ACTIVATION = LogMarkerToken(invoker, activation, start)(MeasurementUnit.none)
+  def INVOKER_DOCKER_CMD(cmd: String) =
+    LogMarkerToken(invoker, "docker", start, Some(cmd), Map("cmd" -> cmd))(MeasurementUnit.time.milliseconds)
   def INVOKER_DOCKER_CMD_TIMEOUT(cmd: String) =
-    LogMarkerToken(invoker, "docker", timeout, Some(cmd), Map("cmd" -> cmd))
-  def INVOKER_RUNC_CMD(cmd: String) = LogMarkerToken(invoker, "runc", start, Some(cmd), Map("cmd" -> cmd))
-  def INVOKER_KUBECTL_CMD(cmd: String) = LogMarkerToken(invoker, "kubectl", start, Some(cmd), Map("cmd" -> cmd))
+    LogMarkerToken(invoker, "docker", timeout, Some(cmd), Map("cmd" -> cmd))(MeasurementUnit.none)
+  def INVOKER_RUNC_CMD(cmd: String) =
+    LogMarkerToken(invoker, "runc", start, Some(cmd), Map("cmd" -> cmd))(MeasurementUnit.time.milliseconds)
+  def INVOKER_KUBEAPI_CMD(cmd: String) =
+    LogMarkerToken(invoker, "kubeapi", start, Some(cmd), Map("cmd" -> cmd))(MeasurementUnit.none)
   def INVOKER_MESOS_CMD(cmd: String) =
-    LogMarkerToken(invoker, "mesos", start, Some(cmd), Map("cmd" -> cmd))
+    LogMarkerToken(invoker, "mesos", start, Some(cmd), Map("cmd" -> cmd))(MeasurementUnit.time.milliseconds)
   def INVOKER_MESOS_CMD_TIMEOUT(cmd: String) =
-    LogMarkerToken(invoker, "mesos", timeout, Some(cmd), Map("cmd" -> cmd))
-  def INVOKER_CONTAINER_START(containerState: String) =
-    LogMarkerToken(invoker, "containerStart", count, Some(containerState), Map("containerState" -> containerState))
+    LogMarkerToken(invoker, "mesos", timeout, Some(cmd), Map("cmd" -> cmd))(MeasurementUnit.none)
+  def INVOKER_CONTAINER_START(containerState: String, invocationNamespace: String, namespace: String, action: String) =
+    LogMarkerToken(
+      invoker,
+      "containerStart",
+      counter,
+      Some(containerState),
+      Map(
+        "containerState" -> containerState,
+        "initiator" -> invocationNamespace,
+        "namespace" -> namespace,
+        "action" -> action))(MeasurementUnit.none)
+  val INVOKER_CONTAINER_HEALTH = LogMarkerToken(invoker, "containerHealth", start)(MeasurementUnit.time.milliseconds)
+  val INVOKER_CONTAINER_HEALTH_FAILED_WARM =
+    LogMarkerToken(invoker, "containerHealthFailed", counter, Some("warm"), Map("containerState" -> "warm"))(
+      MeasurementUnit.none)
+  val INVOKER_CONTAINER_HEALTH_FAILED_PREWARM =
+    LogMarkerToken(invoker, "containerHealthFailed", counter, Some("prewarm"), Map("containerState" -> "prewarm"))(
+      MeasurementUnit.none)
   val CONTAINER_CLIENT_RETRIES =
-    LogMarkerToken(containerClient, "retries", count)
+    LogMarkerToken(containerClient, "retries", counter)(MeasurementUnit.none)
 
-  val INVOKER_TOTALMEM_BLACKBOX = LogMarkerToken(loadbalancer, "totalCapacityBlackBox", count)
-  val INVOKER_TOTALMEM_MANAGED = LogMarkerToken(loadbalancer, "totalCapacityManaged", count)
+  val CONTAINER_POOL_RESCHEDULED_ACTIVATION =
+    LogMarkerToken(containerPool, "rescheduledActivation", counter)(MeasurementUnit.none)
+  val CONTAINER_POOL_RUNBUFFER_COUNT =
+    LogMarkerToken(containerPool, "runBufferCount", counter)(MeasurementUnit.none)
+  val CONTAINER_POOL_RUNBUFFER_SIZE =
+    LogMarkerToken(containerPool, "runBufferSize", counter)(MeasurementUnit.information.megabytes)
+  val CONTAINER_POOL_ACTIVE_COUNT =
+    LogMarkerToken(containerPool, "activeCount", counter)(MeasurementUnit.none)
+  val CONTAINER_POOL_ACTIVE_SIZE =
+    LogMarkerToken(containerPool, "activeSize", counter)(MeasurementUnit.information.megabytes)
+  val CONTAINER_POOL_PREWARM_COUNT =
+    LogMarkerToken(containerPool, "prewarmCount", counter)(MeasurementUnit.none)
+  val CONTAINER_POOL_PREWARM_SIZE =
+    LogMarkerToken(containerPool, "prewarmSize", counter)(MeasurementUnit.information.megabytes)
+  val CONTAINER_POOL_IDLES_COUNT =
+    LogMarkerToken(containerPool, "idlesCount", counter)(MeasurementUnit.none)
+  def CONTAINER_POOL_PREWARM_COLDSTART(memory: String, kind: String) =
+    LogMarkerToken(containerPool, "prewarmColdstart", counter, None, Map("memory" -> memory, "kind" -> kind))(
+      MeasurementUnit.none)
+  def CONTAINER_POOL_PREWARM_EXPIRED(memory: String, kind: String) =
+    LogMarkerToken(containerPool, "prewarmExpired", counter, None, Map("memory" -> memory, "kind" -> kind))(
+      MeasurementUnit.none)
+  val CONTAINER_POOL_IDLES_SIZE =
+    LogMarkerToken(containerPool, "idlesSize", counter)(MeasurementUnit.information.megabytes)
 
-  val HEALTHY_INVOKER_MANAGED = LogMarkerToken(loadbalancer, "totalHealthyInvokerManaged", count)
-  val UNHEALTHY_INVOKER_MANAGED = LogMarkerToken(loadbalancer, "totalUnhealthyInvokerManaged", count)
-  val UNRESPONSIVE_INVOKER_MANAGED = LogMarkerToken(loadbalancer, "totalUnresponsiveInvokerManaged", count)
-  val OFFLINE_INVOKER_MANAGED = LogMarkerToken(loadbalancer, "totalOfflineInvokerManaged", count)
+  val INVOKER_TOTALMEM_BLACKBOX = LogMarkerToken(loadbalancer, "totalCapacityBlackBox", counter)(MeasurementUnit.none)
+  val INVOKER_TOTALMEM_MANAGED = LogMarkerToken(loadbalancer, "totalCapacityManaged", counter)(MeasurementUnit.none)
 
-  val HEALTHY_INVOKER_BLACKBOX = LogMarkerToken(loadbalancer, "totalHealthyInvokerBlackBox", count)
-  val UNHEALTHY_INVOKER_BLACKBOX = LogMarkerToken(loadbalancer, "totalUnhealthyInvokerBlackBox", count)
-  val UNRESPONSIVE_INVOKER_BLACKBOX = LogMarkerToken(loadbalancer, "totalUnresponsiveInvokerBlackBox", count)
-  val OFFLINE_INVOKER_BLACKBOX = LogMarkerToken(loadbalancer, "totalOfflineInvokerBlackBox", count)
+  val HEALTHY_INVOKER_MANAGED =
+    LogMarkerToken(loadbalancer, "totalHealthyInvokerManaged", counter)(MeasurementUnit.none)
+  val UNHEALTHY_INVOKER_MANAGED =
+    LogMarkerToken(loadbalancer, "totalUnhealthyInvokerManaged", counter)(MeasurementUnit.none)
+  val UNRESPONSIVE_INVOKER_MANAGED =
+    LogMarkerToken(loadbalancer, "totalUnresponsiveInvokerManaged", counter)(MeasurementUnit.none)
+  val OFFLINE_INVOKER_MANAGED =
+    LogMarkerToken(loadbalancer, "totalOfflineInvokerManaged", counter)(MeasurementUnit.none)
+
+  val HEALTHY_INVOKER_BLACKBOX =
+    LogMarkerToken(loadbalancer, "totalHealthyInvokerBlackBox", counter)(MeasurementUnit.none)
+  val UNHEALTHY_INVOKER_BLACKBOX =
+    LogMarkerToken(loadbalancer, "totalUnhealthyInvokerBlackBox", counter)(MeasurementUnit.none)
+  val UNRESPONSIVE_INVOKER_BLACKBOX =
+    LogMarkerToken(loadbalancer, "totalUnresponsiveInvokerBlackBox", counter)(MeasurementUnit.none)
+  val OFFLINE_INVOKER_BLACKBOX =
+    LogMarkerToken(loadbalancer, "totalOfflineInvokerBlackBox", counter)(MeasurementUnit.none)
 
   // Kafka related markers
-  def KAFKA_QUEUE(topic: String) = LogMarkerToken(kafka, topic, count)
-  def KAFKA_MESSAGE_DELAY(topic: String) = LogMarkerToken(kafka, topic, start, Some("delay"))
+  def KAFKA_QUEUE(topic: String) =
+    if (TransactionId.metricsKamonTags)
+      LogMarkerToken(kafka, "topic", counter, None, Map("topic" -> topic))(MeasurementUnit.none)
+    else LogMarkerToken(kafka, topic, counter)(MeasurementUnit.none)
+  def KAFKA_MESSAGE_DELAY(topic: String) =
+    if (TransactionId.metricsKamonTags)
+      LogMarkerToken(kafka, "topic", start, Some("delay"), Map("topic" -> topic))(MeasurementUnit.time.milliseconds)
+    else LogMarkerToken(kafka, topic, start, Some("delay"))(MeasurementUnit.time.milliseconds)
 
   /*
    * General markers
    */
-  val DATABASE_CACHE_HIT = LogMarkerToken(database, "cacheHit", count)
-  val DATABASE_CACHE_MISS = LogMarkerToken(database, "cacheMiss", count)
-  val DATABASE_SAVE = LogMarkerToken(database, "saveDocument", start)
-  val DATABASE_BULK_SAVE = LogMarkerToken(database, "saveDocumentBulk", start)
-  val DATABASE_DELETE = LogMarkerToken(database, "deleteDocument", start)
-  val DATABASE_GET = LogMarkerToken(database, "getDocument", start)
-  val DATABASE_QUERY = LogMarkerToken(database, "queryView", start)
-  val DATABASE_ATT_GET = LogMarkerToken(database, "getDocumentAttachment", start)
-  val DATABASE_ATT_SAVE = LogMarkerToken(database, "saveDocumentAttachment", start)
-  val DATABASE_ATT_DELETE = LogMarkerToken(database, "deleteDocumentAttachment", start)
-  val DATABASE_ATTS_DELETE = LogMarkerToken(database, "deleteDocumentAttachments", start)
-  val DATABASE_BATCH_SIZE = LogMarkerToken(database, "batchSize", count)
+  val DATABASE_CACHE_HIT = LogMarkerToken(database, "cacheHit", counter)(MeasurementUnit.none)
+  val DATABASE_CACHE_MISS = LogMarkerToken(database, "cacheMiss", counter)(MeasurementUnit.none)
+  val DATABASE_SAVE =
+    LogMarkerToken(database, "saveDocument", start)(MeasurementUnit.time.milliseconds)
+  val DATABASE_BULK_SAVE =
+    LogMarkerToken(database, "saveDocumentBulk", start)(MeasurementUnit.time.milliseconds)
+  val DATABASE_DELETE =
+    LogMarkerToken(database, "deleteDocument", start)(MeasurementUnit.time.milliseconds)
+  val DATABASE_GET = LogMarkerToken(database, "getDocument", start)(MeasurementUnit.time.milliseconds)
+  val DATABASE_QUERY = LogMarkerToken(database, "queryView", start)(MeasurementUnit.time.milliseconds)
+  val DATABASE_ATT_GET =
+    LogMarkerToken(database, "getDocumentAttachment", start)(MeasurementUnit.time.milliseconds)
+  val DATABASE_ATT_SAVE =
+    LogMarkerToken(database, "saveDocumentAttachment", start)(MeasurementUnit.time.milliseconds)
+  val DATABASE_ATT_DELETE =
+    LogMarkerToken(database, "deleteDocumentAttachment", start)(MeasurementUnit.time.milliseconds)
+  val DATABASE_ATTS_DELETE =
+    LogMarkerToken(database, "deleteDocumentAttachments", start)(MeasurementUnit.time.milliseconds)
+  val DATABASE_BATCH_SIZE = LogMarkerToken(database, "batchSize", counter)(MeasurementUnit.none)
 }

@@ -18,6 +18,7 @@
 package org.apache.openwhisk.core.connector.test
 
 import java.time.Instant
+import java.util.concurrent.TimeUnit
 
 import org.junit.runner.RunWith
 import org.scalatest.{FlatSpec, Matchers}
@@ -39,14 +40,15 @@ class EventMessageTests extends FlatSpec with Matchers {
 
   behavior of "Activation"
 
+  val activationId = ActivationId.generate()
   val fullActivation = WhiskActivation(
     namespace = EntityPath("ns"),
     name = EntityName("a"),
     Subject(),
-    activationId = ActivationId.generate(),
+    activationId = activationId,
     start = Instant.now(),
     end = Instant.now(),
-    response = ActivationResponse.success(Some(JsObject("res" -> JsNumber(1)))),
+    response = ActivationResponse.success(Some(JsObject("res" -> JsNumber(1))), Some(42)),
     annotations = Parameters("limits", ActionLimits(TimeLimit(1.second), MemoryLimit(128.MB), LogLimit(1.MB)).toJson) ++
       Parameters(WhiskActivation.waitTimeAnnotation, 5.toJson) ++
       Parameters(WhiskActivation.initTimeAnnotation, 10.toJson) ++
@@ -57,7 +59,18 @@ class EventMessageTests extends FlatSpec with Matchers {
 
   it should "transform an activation into an event body" in {
     Activation.from(fullActivation) shouldBe Success(
-      Activation("ns2/a", 0, 123, 5, 10, "testkind", false, 128, Some("sequence")))
+      Activation(
+        "ns2/a",
+        activationId.asString,
+        0,
+        toDuration(123),
+        toDuration(5),
+        toDuration(10),
+        "testkind",
+        false,
+        128,
+        Some("sequence"),
+        Some(42)))
   }
 
   it should "fail transformation if needed annotations are missing" in {
@@ -75,6 +88,58 @@ class EventMessageTests extends FlatSpec with Matchers {
             WhiskActivation.pathAnnotation,
             "ns2/a"))
 
-    Activation.from(a) shouldBe Success(Activation("ns2/a", 0, 0, 0, 0, "testkind", false, 0, None))
+    Activation.from(a) shouldBe Success(
+      Activation(
+        "ns2/a",
+        activationId.asString,
+        0,
+        toDuration(0),
+        toDuration(0),
+        toDuration(0),
+        "testkind",
+        false,
+        0,
+        None,
+        Some(42)))
   }
+
+  it should "Transform a activation with status code" in {
+    val resultWithError =
+      """
+        |{
+        | "statusCode" : 404,
+        | "body": "Requested resource not found"
+        |}
+        |""".stripMargin.parseJson
+    val a =
+      fullActivation
+        .copy(response = ActivationResponse.applicationError(resultWithError, Some(42)))
+    Activation.from(a).map(act => act.userDefinedStatusCode) shouldBe Success(Some(404))
+  }
+
+  it should "Transform a activation with error status code" in {
+    val resultWithError =
+      """
+        |{
+        | "error": {
+        |   "statusCode" : "404",
+        |   "body": "Requested resource not found"
+        | }
+        |}
+        |""".stripMargin.parseJson
+    Activation.userDefinedStatusCode(Some(resultWithError)) shouldBe Some(404)
+  }
+
+  it should "Transform a activation with error status code with invalid error code" in {
+    val resultWithInvalidError =
+      """
+        |{
+        |   "statusCode" : "i404",
+        |   "body": "Requested resource not found"
+        |}
+        |""".stripMargin.parseJson
+    Activation.userDefinedStatusCode(Some(resultWithInvalidError)) shouldBe Some(400)
+  }
+
+  def toDuration(milliseconds: Long) = new FiniteDuration(milliseconds, TimeUnit.MILLISECONDS)
 }

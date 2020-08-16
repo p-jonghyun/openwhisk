@@ -74,8 +74,8 @@ task distDockerCoverage() {
         //Copy the scoverage runtime jars
         copy {from configurations.scoverage - configurations.compile; into "build/tmp/docker-coverage/ext-lib"}
         //Copy the scoverage prepared jars
-        coverageJars.each {jar ->
-            copy {from file(jar); into "build/tmp/docker-coverage/lib"; rename { it.replace('-scoverage', '')}}
+        coverageDirs.each {dir ->
+            copy {from file(dir); into "build/tmp/docker-coverage/classes"}
         }
 
         def buildArgs = [
@@ -112,13 +112,14 @@ def prepareBuildArgs(List buildArgs) {
 task tagImage {
     doLast {
         def versionString = (dockerBinary + ['-v']).execute().text
-        def matched = (versionString =~ /(\d+)\.(\d+)\.(\d+)/)
+        def matched = (versionString =~ /^(\S+) version (\d+)\.(\d+)\.(\d+)/)
 
-        def major = matched[0][1] as int
-        def minor = matched[0][2] as int
+        def runner = matched[0][1]
+        def major = matched[0][2] as int
+        def minor = matched[0][3] as int
 
         def dockerCmd = ['tag']
-        if(major == 1 && minor < 12) {
+        if(runner == 'Docker' && major == 1 && minor < 12) {
             dockerCmd += ['-f']
         }
         retry(dockerBinary + dockerCmd + [dockerImageName, dockerTaggedImageName], dockerRetries, dockerTimeout)
