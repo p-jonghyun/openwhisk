@@ -1,5 +1,21 @@
 {
     "runtimes": {
+	"go": [
+            {
+                "kind": "go:1.11",
+                "default": true,
+                "deprecated": false,
+                "attached": {
+                    "attachmentName": "codefile",
+                    "attachmentType": "text/plain"
+                },
+                "image": {
+                    "prefix": "jong1994",
+                    "name": "gogo",
+                    "tag": "rpi"
+                }
+            }
+        ],
         "nodejs": [
             {
                 "kind": "nodejs",
